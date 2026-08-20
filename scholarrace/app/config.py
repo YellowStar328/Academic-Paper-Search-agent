@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     database_url: str = (
         "postgresql+asyncpg://scholar:scholar@localhost:5432/scholarrace"
     )
-    database_url_test: str = "sqlite+aiosqlite:///./test.db"
+    database_url_test: str = "sqlite+aiosqlite:///:memory:"
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"

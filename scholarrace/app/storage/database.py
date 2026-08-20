@@ -25,12 +25,21 @@ def get_engine() -> AsyncEngine:
         settings = get_settings()
         # SQLite needs special args for async
         connect_args = {}
+        kwargs = {}
         if "sqlite" in settings.effective_database_url:
             connect_args = {"check_same_thread": False}
+            # Use StaticPool for in-memory SQLite so all connections share
+            # the same in-memory database (otherwise each connection gets
+            # a separate fresh database).
+            if ":memory:" in settings.effective_database_url:
+                from sqlalchemy.pool import StaticPool
+
+                kwargs["poolclass"] = StaticPool
         _engine = create_async_engine(
             settings.effective_database_url,
             echo=False,
             connect_args=connect_args,
+            **kwargs,
         )
     return _engine
 
