@@ -78,12 +78,12 @@ class PaperIdentityResolver:
         # Venue: prefer non-empty
         venue = primary.venue or secondary.venue
 
-        # DOIs, IDs: prefer non-empty
-        doi = primary.doi or secondary.doi
-        arxiv_id = primary.arxiv_id or secondary.arxiv_id
-        s2_id = primary.semantic_scholar_id or secondary.semantic_scholar_id
-        openalex_id = primary.openalex_id or secondary.openalex_id
-        pubmed_id = primary.pubmed_id or secondary.pubmed_id
+        # DOIs, IDs: prefer non-empty (check both top-level and identity)
+        doi = primary.doi or secondary.doi or primary.identity.doi or secondary.identity.doi
+        arxiv_id = primary.arxiv_id or secondary.arxiv_id or primary.identity.arxiv_id or secondary.identity.arxiv_id
+        s2_id = primary.semantic_scholar_id or secondary.semantic_scholar_id or primary.identity.semantic_scholar_id or secondary.identity.semantic_scholar_id
+        openalex_id = primary.openalex_id or secondary.openalex_id or primary.identity.openalex_id or secondary.identity.openalex_id
+        pubmed_id = primary.pubmed_id or secondary.pubmed_id or primary.identity.pubmed_id or secondary.identity.pubmed_id
 
         # Citation count: take max
         citation_count = max(primary.citation_count, secondary.citation_count)
