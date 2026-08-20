@@ -38,14 +38,19 @@ class MockLLMProvider:
         latency = 10.0 + (hash(prompt) % 50)
 
         # Determine what type of response to generate based on prompt content
-        content = self._generate_response(prompt)
+        # Combine system_prompt + prompt for matching
+        combined = ""
+        if system_prompt:
+            combined += system_prompt + "\n"
+        combined += prompt
+        content = self._generate_response(combined)
         latency = (time.time() - start) * 1000 + latency
 
         return LLMResponse(
             content=content,
             model=self.model_name,
             latency_ms=latency,
-            token_usage=len(prompt) // 4 + 50,
+            token_usage=len(combined) // 4 + 50,
             success=True,
         )
 
