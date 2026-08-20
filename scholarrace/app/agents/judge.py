@@ -99,13 +99,34 @@ class StrongJudge:
         original_query: str,
         candidates: list[CandidateQuery],
     ) -> list[JudgeResult]:
-        """Evaluate multiple candidate queries."""
+        """Evaluate multiple candidate queries in parallel."""
         import asyncio
 
         tasks = [
             self.evaluate_query_candidate(original_query, c) for c in candidates
         ]
         return await asyncio.gather(*tasks)
+
+    async def select_top_candidates(
+        self,
+        original_query: str,
+        candidates: list[CandidateQuery],
+        top_k: int = 5,
+    ) -> list[JudgeResult]:
+        """Evaluate candidates and return the top-k by judge score.
+
+        This is the main entry point for the pipeline: it evaluates all
+        candidates in parallel and returns the best ones.
+        """
+        if not candidates:
+            return []
+
+        results = await self.evaluate_candidates_batch(original_query, candidates)
+
+        # Sort by score descending
+        results.sort(key=lambda r: r.score, reverse=True)
+
+        return results[:top_k]
 
 
 class PaperJudge:
