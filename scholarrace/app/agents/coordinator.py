@@ -67,6 +67,7 @@ class MultiAgentCoordinator:
             try:
                 candidates = await agent.generate_queries(query)
                 latency_ms = (time.time() - t0) * 1000
+                token_usage = getattr(agent, "last_token_usage", 0) or 0
 
                 run = AgentRun(
                     request_id=request_id,
@@ -74,7 +75,7 @@ class MultiAgentCoordinator:
                     query_text=query.original_query,
                     generated_candidates=[c.query for c in candidates],
                     latency_ms=latency_ms,
-                    token_usage=len(candidates) * 100,  # estimated
+                    token_usage=token_usage,
                     success=True,
                 )
                 return candidates, run
@@ -129,6 +130,7 @@ class MultiAgentCoordinator:
         start_time = time.time()
         candidates = await agent.generate_queries(query)
         latency_ms = (time.time() - start_time) * 1000
+        token_usage = getattr(agent, "last_token_usage", 0) or 0
 
         run = AgentRun(
             request_id=request_id,
@@ -136,7 +138,7 @@ class MultiAgentCoordinator:
             query_text=query.original_query,
             generated_candidates=[c.query for c in candidates],
             latency_ms=latency_ms,
-            token_usage=len(candidates) * 100,
+            token_usage=token_usage,
             success=True,
         )
 

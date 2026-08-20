@@ -77,6 +77,8 @@ async def init_db() -> None:
 
     engine = get_engine()
     async with engine.begin() as conn:
+        # Drop first to ensure clean state (important for in-memory SQLite tests)
+        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
 
 

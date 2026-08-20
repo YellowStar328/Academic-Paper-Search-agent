@@ -115,7 +115,10 @@ class HttpClient:
 
     async def get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=self.timeout)
+            self._client = httpx.AsyncClient(
+                timeout=self.timeout,
+                follow_redirects=True,
+            )
         return self._client
 
     async def get(self, url: str, params: Optional[dict] = None, **kwargs) -> httpx.Response:
@@ -131,10 +134,11 @@ class HttpClient:
             response = await retry_with_backoff(
                 _do_get, max_retries=self.max_retries
             )
-            if response.status_code < 500:
+            if response.status_code < 400:
                 self.circuit_breaker.record_success()
-            else:
+            elif response.status_code >= 500:
                 self.circuit_breaker.record_failure()
+            # 4xx (including 429) don't trip circuit breaker
             return response
         except Exception as e:
             self.circuit_breaker.record_failure()

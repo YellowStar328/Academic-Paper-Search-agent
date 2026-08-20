@@ -177,8 +177,9 @@ class TestSearchEndpoint:
     def test_search_no_pipeline_returns_503(self):
         set_pipeline(None)
         client = TestClient(app)
-        response = client.post("/api/search", json={"query": "test"})
-        assert response.status_code == 503
+        with patch("app.main.create_pipeline", side_effect=RuntimeError("init failed")):
+            response = client.post("/api/search", json={"query": "test"})
+            assert response.status_code == 503
 
 
 class TestFeedbackEndpoint:

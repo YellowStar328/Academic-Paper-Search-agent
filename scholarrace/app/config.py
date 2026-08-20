@@ -52,9 +52,32 @@ class Settings(BaseSettings):
     strong_model_name: str = "deepseek-reasoner"
 
     # Search Sources
-    arxiv_base_url: str = "http://export.arxiv.org/api/query"
+    arxiv_base_url: str = "https://export.arxiv.org/api/query"
     arxiv_max_results: int = 50
     arxiv_timeout: int = 30
+
+    # Semantic Scholar
+    semantic_scholar_base_url: str = "https://api.semanticscholar.org/graph/v1/paper/search"
+    semantic_scholar_api_key: str = ""
+    semantic_scholar_max_results: int = 50
+    semantic_scholar_timeout: int = 30
+
+    # OpenAlex
+    openalex_base_url: str = "https://api.openalex.org/works"
+    openalex_email: str = ""
+    openalex_max_results: int = 50
+    openalex_timeout: int = 30
+
+    # CrossRef
+    crossref_base_url: str = "https://api.crossref.org/works"
+    crossref_email: str = ""
+    crossref_max_results: int = 50
+    crossref_timeout: int = 30
+
+    # DBLP
+    dblp_base_url: str = "https://dblp.org/search/publ/api"
+    dblp_max_results: int = 50
+    dblp_timeout: int = 30
 
     # Embedding
     embedding_top_k: int = 100

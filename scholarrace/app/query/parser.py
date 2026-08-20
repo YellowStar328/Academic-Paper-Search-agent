@@ -59,6 +59,7 @@ class QueryParser:
     def __init__(self, provider: Optional[LLMProvider] = None):
         self._provider = provider
         self.model_name = "query_parser"
+        self.last_token_usage: int = 0
 
     @property
     def provider(self) -> LLMProvider:
@@ -91,6 +92,7 @@ class QueryParser:
             system_prompt=QUERY_PARSE_SYSTEM_PROMPT,
             response_schema={"type": "json_object"},
         )
+        self.last_token_usage = response.token_usage
 
         if response.success:
             try:

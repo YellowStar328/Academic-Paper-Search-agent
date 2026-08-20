@@ -41,7 +41,7 @@ cp .env.example .env
 docker-compose up -d
 
 # Run database migrations
-alembic upgrade head
+alembic -c migrations/alembic.ini upgrade head
 ```
 
 ### Running Tests
@@ -57,13 +57,13 @@ APP_ENV=test python -m pytest tests/test_pipeline_integration.py -v
 ### Running the API
 
 ```bash
-# Start the server
+# Start the server (pipeline auto-initializes on startup)
 uvicorn app.main:app --reload
 
 # Health check
 curl http://localhost:8000/health
 
-# Search
+# Search (arXiv results are real; LLM uses mock if no API key in .env)
 curl -X POST http://localhost:8000/api/search \
   -H "Content-Type: application/json" \
   -d '{"query": "transformer architecture survey", "max_results": 10}'
@@ -73,6 +73,10 @@ curl -X POST http://localhost:8000/api/feedback \
   -H "Content-Type: application/json" \
   -d '{"request_id": "...", "paper_id": "...", "rating": 5, "is_relevant": true}'
 ```
+
+> **Note**: The search pipeline is automatically initialized on application startup.
+> If no LLM API keys are set in `.env`, agents will use `MockLLMProvider` (returns
+> deterministic fake queries). The arXiv search provider works without any API key.
 
 ### Running Experiments
 

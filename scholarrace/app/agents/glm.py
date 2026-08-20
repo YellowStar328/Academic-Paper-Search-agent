@@ -34,6 +34,7 @@ class GLMAgent:
     def __init__(self, provider: Optional[LLMProvider] = None):
         self._provider = provider
         self.model_name = "glm"
+        self.last_token_usage: int = 0
 
     @property
     def provider(self) -> LLMProvider:
@@ -57,6 +58,7 @@ class GLMAgent:
             system_prompt=GLM_SYSTEM_PROMPT,
             response_schema={"type": "json_object"},
         )
+        self.last_token_usage = response.token_usage
 
         if not response.success:
             return []

@@ -103,6 +103,8 @@ class AuthorityScorer:
             return 0.8
         if "crossref" in source_lower:
             return 0.7
+        if "dblp" in source_lower:
+            return 0.8  # curated CS bibliography, high metadata quality
         return 0.5
 
     def score(self, paper: Paper, source: str = "") -> float:

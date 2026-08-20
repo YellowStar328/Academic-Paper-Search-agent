@@ -220,6 +220,8 @@ class SearchPipeline:
             search_query = await self._parser.parse(
                 user_query.query, user_query.options
             )
+            self._metrics.record_llm_call(self._parser.last_token_usage)
+            self._metrics.record_model_used(self._parser.model_name)
             logger.info(
                 f"[{request_id}] Stage 1: domain={search_query.domain}, "
                 f"intent={search_query.intent.value}"
@@ -245,6 +247,7 @@ class SearchPipeline:
             )
             for run in agent_runs:
                 self._metrics.record_model_used(run.model_name)
+                self._metrics.record_llm_call(run.token_usage)
             logger.info(
                 f"[{request_id}] Stage 2: {len(candidates)} candidates generated"
             )
@@ -266,6 +269,8 @@ class SearchPipeline:
             judged = await self._judge.evaluate_candidates_batch(
                 search_query.original_query, candidates
             )
+            self._metrics.record_llm_call(self._judge.last_token_usage)
+            self._metrics.record_model_used(self._judge.model_name)
             logger.info(
                 f"[{request_id}] Stage 3: {len(judged)} candidates judged"
             )
@@ -309,14 +314,17 @@ class SearchPipeline:
     ) -> list[Paper]:
         """Search all providers."""
         try:
-            # Build search queries from judged candidates
+            # Build search queries: always include original query + judged candidates
+            queries = [search_query.original_query]
             if judged:
-                queries = [
+                # Add top judged candidates (sorted by score descending)
+                candidate_queries = [
                     jr.candidate.query
                     for jr in sorted(judged, key=lambda j: j.score, reverse=True)
                 ]
-            else:
-                queries = [search_query.semantic_core]
+                for q in candidate_queries:
+                    if q and q not in queries:
+                        queries.append(q)
 
             # Search all providers in parallel
             max_per_source = self._settings.thompson_total_budget // max(
@@ -445,6 +453,8 @@ class SearchPipeline:
             results = await self._paper_judge.evaluate_papers_batch(
                 search_query.semantic_core, papers
             )
+            self._metrics.record_llm_call(self._paper_judge.last_token_usage)
+            self._metrics.record_model_used(self._paper_judge.model_name)
             logger.info(
                 f"[{request_id}] Stage 9: {len(results)} papers judged"
             )
@@ -466,6 +476,7 @@ class SearchPipeline:
                 papers,
                 search_query.semantic_core,
                 judge_results=judge_results if judge_results else None,
+                top_k=search_query.options.top_k,
             )
             self._metrics.record_papers_final(len(ranked))
             logger.info(
@@ -479,7 +490,7 @@ class SearchPipeline:
                 papers,
                 key=lambda p: p.citation_count,
                 reverse=True,
-            )[: self._settings.final_top_k]
+            )[: search_query.options.top_k]
             return [
                 PaperWithScores(
                     paper=p,

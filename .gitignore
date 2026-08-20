@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# CodeBuddy project data (not for version control)
+.codebuddy/
+
 # C extensions
 *.so
 

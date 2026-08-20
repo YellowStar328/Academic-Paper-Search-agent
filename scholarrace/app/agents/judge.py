@@ -49,6 +49,7 @@ class StrongJudge:
     def __init__(self, provider: Optional[LLMProvider] = None):
         self._provider = provider
         self.model_name = "strong_judge"
+        self.last_token_usage: int = 0
 
     @property
     def provider(self) -> LLMProvider:
@@ -77,6 +78,7 @@ class StrongJudge:
             system_prompt=JUDGE_SYSTEM_PROMPT,
             response_schema={"type": "json_object"},
         )
+        self.last_token_usage += response.token_usage
 
         if not response.success:
             return JudgeResult(candidate=candidate, score=0.5, reasoning="Judge failed")
@@ -135,6 +137,7 @@ class PaperJudge:
     def __init__(self, provider: Optional[LLMProvider] = None):
         self._provider = provider
         self.model_name = "paper_judge"
+        self.last_token_usage: int = 0
 
     @property
     def provider(self) -> LLMProvider:
@@ -163,6 +166,7 @@ class PaperJudge:
             system_prompt=JUDGE_SYSTEM_PROMPT,
             response_schema={"type": "json_object"},
         )
+        self.last_token_usage += response.token_usage
 
         if not response.success:
             return PaperJudgeResult(

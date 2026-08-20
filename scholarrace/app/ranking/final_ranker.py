@@ -112,6 +112,7 @@ class FinalRanker:
         papers: list[Paper],
         query: str,
         judge_results: Optional[list[PaperJudgeResult]] = None,
+        top_k: Optional[int] = None,
     ) -> list[PaperWithScores]:
         """Rank papers and return top-K with scores.
 
@@ -192,13 +193,16 @@ class FinalRanker:
         # Sort by initial final score
         scored.sort(key=lambda x: x.final_score, reverse=True)
 
+        # Resolve effective top_k: explicit arg > instance default
+        effective_top_k = top_k or self._top_k
+
         # Apply MMR on top candidates for diversity
-        top_candidates = scored[: self._top_k * 2]  # over-select for MMR
+        top_candidates = scored[: effective_top_k * 2]  # over-select for MMR
         top_papers = [s.paper for s in top_candidates]
         relevance_scores = [s.relevance_score for s in top_candidates]
 
         mmr_papers = self._mmr.select(
-            top_papers, query, self._top_k, relevance_scores
+            top_papers, query, effective_top_k, relevance_scores
         )
         mmr_ids = {p.paper_id for p in mmr_papers}
 

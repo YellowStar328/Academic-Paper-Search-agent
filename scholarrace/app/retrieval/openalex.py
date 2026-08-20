@@ -1,29 +1,42 @@
-"""OpenAlex search provider — Mock implementation."""
+"""OpenAlex search provider — real API integration.
+
+OpenAlex is a fully-open catalog of scholarly works (no API key required).
+API docs: https://docs.openalex.org/
+
+In test mode (APP_ENV=test), falls back to mock data for unit tests.
+"""
 
 from __future__ import annotations
 
-from uuid import uuid4
+import logging
+from datetime import date
 from typing import Optional
+from uuid import uuid4
 
+from app.config import get_settings
 from app.models.paper import Paper, PaperIdentity, PaperList
 from app.retrieval.base import BaseSearchProvider
+from app.utils.http_client import HttpClient
 
+logger = logging.getLogger(__name__)
+
+# Mock data for test mode
 _MOCK_PAPERS = [
     Paper(
         paper_id=str(uuid4()),
         identity=PaperIdentity(
             openalex_id="mock-openalex-001",
-            normalized_title="imageneretclassificationwithdeeepconvolutionalneuralnetworks",
+            normalized_title="imagenetclassificationwithdeepconvolutionalneuralnetworks",
             year=2012,
         ),
         title="ImageNet Classification with Deep Convolutional Neural Networks",
-        abstract="We trained a large, deep convolutional neural network to classify the 1.2 million high-resolution images in the ImageNet LSVRC-2010 contest.",
+        abstract="We trained a large, deep convolutional neural network to classify images.",
         authors=["Alex Krizhevsky", "Ilya Sutskever", "Geoffrey Hinton"],
         year=2012,
         venue="NeurIPS",
         openalex_id="mock-openalex-001",
         url="https://openalex.org/mock-openalex-001",
-        citation_count=40000,
+        citation_count=80000,
         fields_of_study=["Computer Science"],
         source="openalex",
     ),
@@ -31,17 +44,17 @@ _MOCK_PAPERS = [
         paper_id=str(uuid4()),
         identity=PaperIdentity(
             openalex_id="mock-openalex-002",
-            normalized_title="residuallearningforimagerecognition",
+            normalized_title="residualnetworksforimageclassification",
             year=2016,
         ),
-        title="Deep Residual Learning for Image Recognition",
-        abstract="We present a residual learning framework to ease the training of networks that are substantially deeper than those used previously.",
-        authors=["Kaiming He", "Xiangyu Zhang", "Shaoqing Ren"],
+        title="Residual Networks for Image Classification",
+        abstract="We present a residual learning framework for training deep networks.",
+        authors=["Kaiming He", "Xiangyu Zhang"],
         year=2016,
         venue="CVPR",
         openalex_id="mock-openalex-002",
         url="https://openalex.org/mock-openalex-002",
-        citation_count=50000,
+        citation_count=60000,
         fields_of_study=["Computer Science"],
         source="openalex",
     ),
@@ -49,16 +62,65 @@ _MOCK_PAPERS = [
 
 
 class OpenAlexProvider(BaseSearchProvider):
-    """Mock OpenAlex search provider."""
+    """OpenAlex API search provider.
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    Uses the Works API: https://api.openalex.org/works
+    Free, no authentication required (email in User-Agent for polite pool).
+    """
+
+    def __init__(self, http_client: Optional[HttpClient] = None):
+        settings = get_settings()
+        super().__init__(
+            http_client=http_client or HttpClient(timeout=settings.openalex_timeout),
+            timeout=settings.openalex_timeout,
+        )
+        self.base_url = settings.openalex_base_url
+        self.email = settings.openalex_email or "research@example.com"
+        self.max_results = settings.openalex_max_results
+        self._is_test = settings.is_test
 
     @property
     def source_name(self) -> str:
         return "openalex"
 
     async def search(self, query: str, max_results: int = 50) -> PaperList:
+        """Search OpenAlex for papers matching the query."""
+        if self._is_test:
+            return self._mock_search(query, max_results)
+
+        max_results = min(max_results, self.max_results)
+        params = {
+            "search": query,
+            "per-page": min(max_results, 200),
+            "mailto": self.email,
+        }
+
+        try:
+            response = await self._http_client.get(
+                self.base_url, params=params
+            )
+            if response.status_code != 200:
+                logger.error(
+                    f"OpenAlex API returned {response.status_code}: {response.text[:200]}"
+                )
+                return PaperList(source=self.source_name)
+
+            import json
+
+            data = json.loads(response.text)
+            papers = []
+            for item in data.get("results", []):
+                paper = self._parse_item(item)
+                if paper:
+                    papers.append(paper)
+
+            return PaperList(papers=papers, source=self.source_name)
+        except Exception as e:
+            logger.error(f"OpenAlex search failed: {e}")
+            return PaperList(source=self.source_name)
+
+    def _mock_search(self, query: str, max_results: int) -> PaperList:
+        """Mock search for test mode."""
         query_lower = query.lower()
         keywords = query_lower.split()
         matched = []
@@ -70,8 +132,155 @@ class OpenAlexProvider(BaseSearchProvider):
             matched = list(_MOCK_PAPERS)
         return PaperList(papers=matched[:max_results], source=self.source_name)
 
-    async def get_paper(self, paper_id: str) -> Optional[Paper]:
-        for paper in _MOCK_PAPERS:
-            if paper.openalex_id == paper_id:
-                return paper
-        return None
+    def _parse_item(self, item: dict) -> Optional[Paper]:
+        """Parse an OpenAlex API result item into a Paper."""
+        try:
+            title = item.get("display_name", "") or item.get("title", "") or ""
+            abstract_inverted = item.get("abstract_inverted_index")
+            abstract = self._reconstruct_abstract(abstract_inverted)
+
+            year = item.get("publication_year")
+
+            # Publication date
+            pub_date = None
+            pub_date_str = item.get("publication_date")
+            if pub_date_str:
+                try:
+                    parts = pub_date_str.split("-")
+                    y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+                    pub_date = date(y, m, d)
+                except (ValueError, IndexError):
+                    pass
+
+            # Authors
+            authors = []
+            authorships = item.get("authorships", [])
+            for a in authorships:
+                author = a.get("author") or {}
+                name = author.get("display_name", "")
+                if name:
+                    authors.append(name)
+
+            # IDs
+            doi_url = item.get("doi") or ""
+            doi = doi_url.replace("https://doi.org/", "") if doi_url else None
+
+            # OpenAlex ID -> raw id
+            openalex_id_full = item.get("id", "")
+            openalex_id = (
+                openalex_id_full.replace("https://openalex.org/", "")
+                if openalex_id_full
+                else None
+            )
+
+            # URL (landing page)
+            url = item.get("id") or openalex_id_full or ""
+
+            # PDF URL from best_oa_location
+            pdf_url = None
+            best_oa = item.get("best_oa_location")
+            if best_oa:
+                pdf_url = best_oa.get("pdf_url") or best_oa.get("landing_page_url")
+
+            # Citation count
+            citation_count = item.get("cited_by_count", 0) or 0
+
+            # Venue
+            venue = ""
+            primary_location = item.get("primary_location")
+            if primary_location:
+                source_info = primary_location.get("source") or {}
+                venue = source_info.get("display_name", "") or ""
+
+            # Fields of study
+            fields = []
+            concepts = item.get("concepts", [])
+            for c in concepts[:5]:
+                name = c.get("display_name", "")
+                if name:
+                    fields.append(name)
+            # Also try topics (newer OpenAlex API)
+            topics = item.get("topics", [])
+            for t in topics[:3]:
+                name = t.get("display_name", "")
+                if name and name not in fields:
+                    fields.append(name)
+
+            # arXiv ID from ids
+            ids = item.get("ids") or {}
+            arxiv_id = ids.get("openalex")  # fallback
+            # Try to extract arxiv from external locations
+            if not arxiv_id:
+                for loc in item.get("locations", []):
+                    landing = loc.get("landing_page_url", "") or ""
+                    if "arxiv.org" in landing:
+                        import re
+
+                        m = re.search(r"arxiv\.org/(?:abs|pdf)/(\d+\.\d+|[a-z\-]+/\d+\.\d+)", landing)
+                        if m:
+                            arxiv_id = m.group(1)
+                            break
+
+            identity = PaperIdentity(
+                doi=doi,
+                arxiv_id=arxiv_id,
+                openalex_id=openalex_id,
+                normalized_title=title.lower().replace(" ", ""),
+                year=year,
+            )
+
+            return Paper(
+                paper_id=str(uuid4()),
+                identity=identity,
+                title=title,
+                abstract=abstract,
+                authors=authors,
+                year=year,
+                publication_date=pub_date,
+                doi=doi,
+                arxiv_id=arxiv_id,
+                openalex_id=openalex_id,
+                url=url,
+                pdf_url=pdf_url,
+                citation_count=citation_count,
+                venue=venue,
+                fields_of_study=fields,
+                source=self.source_name,
+            )
+        except Exception as e:
+            logger.error(f"Failed to parse OpenAlex item: {e}")
+            return None
+
+    @staticmethod
+    def _reconstruct_abstract(inverted_index: Optional[dict]) -> str:
+        """Reconstruct abstract from OpenAlex inverted index format."""
+        if not inverted_index:
+            return ""
+        positions = []
+        for word, indices in inverted_index.items():
+            for idx in indices:
+                positions.append((idx, word))
+        positions.sort()
+        return " ".join(w for _, w in positions)
+
+    async def get_paper(self, openalex_id: str) -> Optional[Paper]:
+        """Get a single paper by OpenAlex ID."""
+        if self._is_test:
+            for paper in _MOCK_PAPERS:
+                if paper.openalex_id == openalex_id:
+                    return paper
+            return None
+
+        url = f"{self.base_url.rstrip('/')}/{openalex_id}"
+        params = {"mailto": self.email}
+        try:
+            response = await self._http_client.get(url, params=params)
+            if response.status_code != 200:
+                return None
+            import json
+
+            item = json.loads(response.text)
+            return self._parse_item(item)
+        except Exception as e:
+            logger.error(f"OpenAlex get_paper failed: {e}")
+            return None

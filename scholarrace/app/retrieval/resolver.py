@@ -54,6 +54,46 @@ class PaperIdentityResolver:
         deduped = self.resolve(paper_list.papers)
         return PaperList(papers=deduped, source=paper_list.source)
 
+    # Preprint / repository venues that should be deprioritized when a
+    # formal conference/journal venue is available.
+    _PREPRINT_VENUES = {
+        "arxiv",
+        "arxiv.org",
+        "preprint",
+        "biorxiv",
+        "chemrxiv",
+        "ssrn",
+        "researchgate",
+        "academia.edu",
+        "open review",
+        "openreview",
+    }
+
+    def _prefer_formal_venue(self, v1: str, v2: str) -> str:
+        """Pick the formal conference/journal venue over a preprint repository.
+
+        When a paper exists on both arXiv and a conference (e.g. NeurIPS),
+        keeping the conference venue yields a higher authority score.
+        Returns "" if both are empty (Paper.venue is a non-optional str).
+        """
+        v1 = v1 or ""
+        v2 = v2 or ""
+        if not v1 and not v2:
+            return ""
+        if not v1:
+            return v2
+        if not v2:
+            return v1
+
+        v1_is_preprint = v1.lower().strip() in self._PREPRINT_VENUES
+        v2_is_preprint = v2.lower().strip() in self._PREPRINT_VENUES
+
+        if v1_is_preprint and not v2_is_preprint:
+            return v2
+        if v2_is_preprint and not v1_is_preprint:
+            return v1
+        return v1 or v2
+
     def _merge_papers(self, primary: Paper, secondary: Paper) -> Paper:
         """Merge two papers, preferring non-empty fields from either."""
         # Prefer the paper with more complete metadata
@@ -75,8 +115,9 @@ class PaperIdentityResolver:
         # Year: prefer the one that exists
         year = primary.year or secondary.year
 
-        # Venue: prefer non-empty
-        venue = primary.venue or secondary.venue
+        # Venue: prefer formal venue (conference/journal) over preprint sources.
+        # E.g. when arXiv preprint and NeurIPS version both match, keep "NeurIPS".
+        venue = self._prefer_formal_venue(primary.venue, secondary.venue)
 
         # DOIs, IDs: prefer non-empty (check both top-level and identity)
         doi = primary.doi or secondary.doi or primary.identity.doi or secondary.identity.doi
@@ -104,7 +145,7 @@ class PaperIdentityResolver:
         pdf_url = primary.pdf_url or secondary.pdf_url
 
         # Source: prefer the one with more data (or combine)
-        source = primary.source
+        source = primary.source or secondary.source
 
         # Publication date: prefer the one that exists
         pub_date = primary.publication_date or secondary.publication_date
