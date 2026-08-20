@@ -94,6 +94,7 @@ class PipelineMetrics(BaseModel):
 class SearchResult(BaseModel):
     """Final output of a search pipeline run."""
 
+    request_id: str = ""
     query: str
     semantic_core: str = ""
     papers: list[PaperWithScores] = Field(default_factory=list)
@@ -101,3 +102,17 @@ class SearchResult(BaseModel):
     metrics: Optional[PipelineMetrics] = None
     raw_candidates: list[CandidateQuery] = Field(default_factory=list)
     judged_candidates: list[Any] = Field(default_factory=list)
+    latency_ms: float = 0.0
+    summary: Optional["SearchSummary"] = None
+
+
+class SearchSummary(BaseModel):
+    """Human-readable summary of search results."""
+
+    total_papers: int = 0
+    query: str = ""
+    domain: str = "general"
+    intent: str = "survey"
+    top_paper_title: Optional[str] = None
+    clusters_count: int = 0
+    timeline_span: Optional[str] = None

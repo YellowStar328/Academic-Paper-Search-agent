@@ -76,6 +76,7 @@ class Settings(BaseSettings):
     thompson_batch_size: int = 16
     thompson_initial_alpha: float = 1.0
     thompson_initial_beta: float = 1.0
+    thompson_total_budget: int = 50
 
     # Citation Expansion
     citation_expansion_depth: int = 1
