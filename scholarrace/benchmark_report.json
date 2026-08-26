@@ -1,0 +1,102 @@
+{
+  "tool": "ScholarRace",
+  "top_k": 20,
+  "concurrency": 1,
+  "dry_run": false,
+  "benchmarks": {
+    "pasa": {
+      "num_examples": 1,
+      "aggregate": {
+        "recall@20": 0.0,
+        "precision@20": 0.0,
+        "f1@20": 0.0,
+        "mrr@20": 0.0,
+        "hit@20": 0.0,
+        "num_queries": 1,
+        "avg_latency_s": 601.21,
+        "avg_retrieved": 14.0,
+        "avg_gold": 9.0
+      },
+      "per_query": [
+        {
+          "recall@20": 0.0,
+          "precision@20": 0.0,
+          "f1@20": 0.0,
+          "mrr@20": 0.0,
+          "hit@20": 0,
+          "num_gold": 9,
+          "num_retrieved": 14,
+          "query": "Give me papers which show that using a smaller dataset in large language model pre-training can result in better models than using bigger datasets.",
+          "elapsed_s": 601.21,
+          "retrieved_ids": [
+            "2510.03313",
+            "2302.13971",
+            "2502.10341",
+            "2105.03404",
+            "2203.02155",
+            "2407.12854",
+            "2506.04689",
+            "2311.16867",
+            "2507.17702",
+            "2112.11446",
+            "2006.16668",
+            "2405.03133",
+            "2502.06663",
+            "2305.16264"
+          ],
+          "gold_ids": [
+            "2107.06499",
+            "2210.10951",
+            "2305.02301",
+            "2305.12816",
+            "2307.08701",
+            "2309.04564",
+            "2402.04333",
+            "2402.09668",
+            "2409.17312"
+          ]
+        }
+      ],
+      "reference_metrics": {
+        "Google (Recall@20/50/100)": {
+          "recall@20": 0.1568,
+          "recall@50": 0.1891,
+          "recall@100": 0.2015
+        },
+        "Google Scholar (Recall@20/50/100)": {
+          "recall@20": 0.0609,
+          "recall@50": 0.097,
+          "recall@100": 0.113
+        },
+        "Google+GPT-4o (Recall@20/50/100)": {
+          "recall@20": 0.1921,
+          "recall@50": 0.245,
+          "recall@100": 0.2683
+        },
+        "ChatGPT": {
+          "precision": 0.228,
+          "recall": 0.2007
+        },
+        "GPT-o1": {
+          "precision": 0.058,
+          "recall": 0.0134
+        },
+        "PaSa-GPT-4o": {
+          "crawler_recall": 0.5494,
+          "precision": 0.4721,
+          "recall": 0.3075
+        },
+        "PaSa-7b": {
+          "crawler_recall": 0.7071,
+          "precision": 0.5146,
+          "recall": 0.6111
+        },
+        "PaSa-7b-ensemble": {
+          "crawler_recall": 0.7503,
+          "precision": 0.4938,
+          "recall": 0.6488
+        }
+      }
+    }
+  }
+}

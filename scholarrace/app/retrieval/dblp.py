@@ -16,7 +16,7 @@ from xml.etree import ElementTree as ET
 
 from app.config import get_settings
 from app.models.paper import Paper, PaperIdentity, PaperList
-from app.retrieval.base import BaseSearchProvider
+from app.retrieval.base import BaseSearchProvider, filter_papers_by_year
 from app.utils.http_client import HttpClient
 
 logger = logging.getLogger(__name__)
@@ -74,18 +74,30 @@ class DblpProvider(BaseSearchProvider):
     def source_name(self) -> str:
         return "dblp"
 
-    async def search(self, query: str, max_results: int = 50) -> PaperList:
+    async def search(
+        self,
+        query: str,
+        max_results: int = 50,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
+    ) -> PaperList:
         """Search DBLP for papers matching the query.
 
         Uses the DBLP publication search API:
         https://dblp.org/search/publ/api?q=...&format=json&h=...
+
+        DBLP API has no server-side year filter, so when year_start/year_end
+        are provided, results are filtered at the client level.
         """
         max_results = min(max_results, self.max_results)
 
         # Test mode: return mock data
         if get_settings().is_test:
+            papers = _MOCK_PAPERS[:max_results]
+            if year_start is not None or year_end is not None:
+                papers = filter_papers_by_year(papers, year_start, year_end)
             return PaperList(
-                papers=_MOCK_PAPERS[:max_results],
+                papers=papers,
                 source=self.source_name,
             )
 
@@ -96,10 +108,13 @@ class DblpProvider(BaseSearchProvider):
         }
 
         try:
-            response = await self._http_client.get_json(
+            response = await self._http_client.get(
                 self.base_url, params=params
             )
-            papers = self._parse_results(response)
+            data = response.json()
+            papers = self._parse_results(data)
+            if year_start is not None or year_end is not None:
+                papers = filter_papers_by_year(papers, year_start, year_end)
             logger.info(
                 f"DBLP: returned {len(papers)} results for '{query}'"
             )

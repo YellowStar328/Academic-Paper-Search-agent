@@ -50,6 +50,8 @@ from app.models.result import (
     SearchSummary,
 )
 from app.query.parser import QueryParser
+from app.query.refiner import QueryRefiner
+from app.retrieval.arxiv import ArxivProvider
 from app.retrieval.base import SearchProvider
 from app.retrieval.resolver import PaperIdentityResolver
 from app.ranking.authority import AuthorityScorer
@@ -106,6 +108,8 @@ class SearchPipeline:
         thompson_manager: Optional[ThompsonSamplingManager] = None,
         metrics: Optional[MetricsTracker] = None,
         settings: Optional[Settings] = None,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
     ):
         self._parser = query_parser
         self._coordinator = coordinator
@@ -125,6 +129,11 @@ class SearchPipeline:
         self._thompson = thompson_manager
         self._metrics = metrics or MetricsTracker()
         self._settings = settings or get_settings()
+        self._query_refiner = QueryRefiner()
+        # Optional publication year range for filtering search results.
+        # When set, all provider search calls are restricted to this range.
+        self._year_start = year_start
+        self._year_end = year_end
 
     async def run(self, user_query: UserQuery) -> SearchResult:
         """Execute the full 14-stage pipeline and return SearchResult."""
@@ -143,6 +152,18 @@ class SearchPipeline:
         search_query = await self._stage1_query_understanding(
             user_query, request_id
         )
+
+        # Dynamically extract year range from parsed hard_filters so that
+        # provider search calls and citation expansion respect the user's
+        # year constraints (e.g. "2025-2026").
+        hf = search_query.hard_filters
+        if hf and (hf.year_start is not None or hf.year_end is not None):
+            self._year_start = hf.year_start
+            self._year_end = hf.year_end
+            logger.info(
+                f"[{request_id}] Year filter applied: "
+                f"{self._year_start}-{self._year_end}"
+            )
 
         # Stage 2: Multi-agent generation
         candidates = await self._stage2_multi_agent_generation(
@@ -171,6 +192,9 @@ class SearchPipeline:
 
         # Stage 7: Deduplication
         papers = await self._stage7_dedup(papers, request_id)
+
+        # Stage 7b: arXiv ID enrichment via CrossRef DOI lookup
+        papers = await self._stage7b_arxiv_enrichment(papers, request_id)
 
         # Stage 8: Embedding coarse ranking
         papers = await self._stage8_embedding_ranking(
@@ -205,6 +229,11 @@ class SearchPipeline:
             f"[{request_id}] Pipeline completed in {result.latency_ms:.0f}ms, "
             f"{len(result.papers)} papers returned"
         )
+
+        # Reset dynamic year filters so subsequent queries on the same
+        # pipeline instance don't inherit stale constraints.
+        self._year_start = None
+        self._year_end = None
 
         return result
 
@@ -262,18 +291,38 @@ class SearchPipeline:
         search_query: SearchQuery,
         request_id: str,
     ) -> list[JudgeResult]:
-        """Evaluate candidate queries via strong judge."""
+        """Evaluate candidate queries.
+
+        Token-saving strategy: by default uses agent cross-evaluation
+        (0 STRONG calls) — each of the 3 agents (Qwen/DeepSeek/GLM)
+        evaluates all candidates, and scores are averaged.
+
+        Set ``settings.use_strong_judge=True`` to fall back to the
+        original STRONG-based evaluation.
+        """
         try:
             if not candidates:
                 return []
-            judged = await self._judge.evaluate_candidates_batch(
-                search_query.original_query, candidates
-            )
-            self._metrics.record_llm_call(self._judge.last_token_usage)
-            self._metrics.record_model_used(self._judge.model_name)
-            logger.info(
-                f"[{request_id}] Stage 3: {len(judged)} candidates judged"
-            )
+
+            # Default: cross-evaluation via agents (0 STRONG calls)
+            if not getattr(self._settings, "use_strong_judge", False):
+                judged = await self._coordinator.evaluate_candidates_cross(
+                    search_query.original_query, candidates
+                )
+                logger.info(
+                    f"[{request_id}] Stage 3 (cross-eval): "
+                    f"{len(judged)} candidates evaluated by agents"
+                )
+            else:
+                judged = await self._judge.evaluate_candidates_batch(
+                    search_query.original_query, candidates
+                )
+                self._metrics.record_llm_call(self._judge.last_token_usage)
+                self._metrics.record_model_used(self._judge.model_name)
+                logger.info(
+                    f"[{request_id}] Stage 3 (STRONG): "
+                    f"{len(judged)} candidates judged"
+                )
             return judged
         except Exception as e:
             logger.error(f"[{request_id}] Stage 3 failed: {e}")
@@ -312,29 +361,71 @@ class SearchPipeline:
         budget: dict[str, int],
         request_id: str,
     ) -> list[Paper]:
-        """Search all providers."""
-        try:
-            # Build search queries: always include original query + judged candidates
-            queries = [search_query.original_query]
-            if judged:
-                # Add top judged candidates (sorted by score descending)
-                candidate_queries = [
-                    jr.candidate.query
-                    for jr in sorted(judged, key=lambda j: j.score, reverse=True)
-                ]
-                for q in candidate_queries:
-                    if q and q not in queries:
-                        queries.append(q)
+        """Search all providers using LLM-refined queries.
 
-            # Search all providers in parallel
-            max_per_source = self._settings.thompson_total_budget // max(
-                len(queries), 1
+        Uses QueryRefiner (strong LLM) to convert natural-language queries into
+        provider-specific search syntax:
+        - arXiv: field-specific syntax (e.g. all:"data quality" AND all:"pretraining")
+        - Semantic Scholar: concise keyword phrases
+        - Other providers: concise keyword phrases
+        """
+        try:
+            # Collect unique raw queries: original + judged candidates
+            raw_queries = [search_query.original_query]
+            sorted_judged = sorted(judged, key=lambda j: j.score, reverse=True)
+            if sorted_judged:
+                candidate_queries = [jr.candidate.query for jr in sorted_judged]
+                for q in candidate_queries:
+                    if q and q not in raw_queries:
+                        raw_queries.append(q)
+
+            queries_to_search = raw_queries[:5]  # limit to top 5 queries
+
+            # Refine ALL queries via strong LLM into provider-specific syntax
+            refined_results: list[dict[str, str | list[str]]] = []
+            try:
+                refined_results = await self._query_refiner.refine_candidates(
+                    search_query,
+                    [jr.candidate for jr in sorted_judged],
+                )
+                # Ensure we have one refined dict per raw query
+                while len(refined_results) < len(queries_to_search):
+                    refined_results.append({
+                        "arxiv_query": queries_to_search[len(refined_results)],
+                        "s2_query": queries_to_search[len(refined_results)],
+                        "keywords": [],
+                    })
+                refined_results = refined_results[: len(queries_to_search)]
+            except Exception as e:
+                logger.warning(
+                    f"[{request_id}] QueryRefiner failed, using raw queries: {e}"
+                )
+                refined_results = [
+                    {"arxiv_query": q, "s2_query": q, "keywords": []}
+                    for q in queries_to_search
+                ]
+
+            # Each provider × query call should retrieve up to max_per_source
+            # papers. Budget is per-provider-per-query, NOT divided by the
+            # number of queries (that would starve each call).
+            #
+            # thompson_total_budget is the *total* papers we want across all
+            # sources. We divide by provider count so each provider fetches
+            # its fair share. Dedup later handles overlaps.
+            max_per_source = max(
+                self._settings.thompson_total_budget // max(len(self._providers), 1),
+                10,  # floor: at least 10 per call
             )
 
             all_papers: list[Paper] = []
             tasks = []
             for provider in self._providers:
-                for q in queries[:5]:  # limit to top 5 queries
+                is_arxiv = isinstance(provider, ArxivProvider)
+                # Pick the right refined query field for this provider
+                query_field = "arxiv_query" if is_arxiv else "s2_query"
+                provider_queries = [r[query_field] for r in refined_results]
+
+                for q in provider_queries:
                     tasks.append(
                         self._search_provider(
                             provider, q, max_per_source, request_id
@@ -364,10 +455,19 @@ class SearchPipeline:
         max_results: int,
         request_id: str,
     ) -> list[Paper]:
-        """Search a single provider (failure-isolated)."""
+        """Search a single provider (failure-isolated).
+
+        Passes the pipeline-level year_start/year_end (if any) to the
+        provider's search method for publication-year filtering.
+        """
         try:
             source_name = getattr(provider, "source_name", "unknown")
-            paper_list = await provider.search(query, max_results=max_results)
+            paper_list = await provider.search(
+                query,
+                max_results=max_results,
+                year_start=self._year_start,
+                year_end=self._year_end,
+            )
             self._metrics.record_source_used(source_name)
             return paper_list.papers
         except Exception as e:
@@ -388,6 +488,11 @@ class SearchPipeline:
             if not papers or not search_query.options.enable_citation_expansion:
                 return papers
 
+            # Pass current year range to citation expander so expanded
+            # papers also respect the user's year constraints.
+            self._citation_expander.set_year_range(
+                self._year_start, self._year_end
+            )
             expanded = await self._citation_expander.expand(papers)
             logger.info(
                 f"[{request_id}] Stage 6: {len(papers)} → {len(expanded)} "
@@ -414,6 +519,82 @@ class SearchPipeline:
         except Exception as e:
             logger.error(f"[{request_id}] Stage 7 failed: {e}")
             return papers
+
+    async def _stage7b_arxiv_enrichment(
+        self, papers: list[Paper], request_id: str
+    ) -> list[Paper]:
+        """Enrich papers missing arXiv IDs by looking up their DOIs via CrossRef.
+
+        Papers from OpenAlex/CrossRef/DBLP often lack an arXiv ID even when
+        the underlying paper is on arXiv.  This stage batches DOI lookups to
+        CrossRef, which returns the full record including links that may
+        contain arXiv URLs.  Only papers with a DOI but no arXiv ID are
+        looked up; existing arXiv IDs are never overwritten.
+        """
+        if not papers:
+            return papers
+
+        # Find the CrossRef provider (if any) for DOI→record lookup.
+        crossref_provider = None
+        for p in self._providers:
+            if getattr(p, "source_name", "") == "crossref":
+                crossref_provider = p
+                break
+
+        if crossref_provider is None:
+            logger.debug(
+                f"[{request_id}] Stage 7b: no CrossRef provider, "
+                f"skipping arXiv enrichment"
+            )
+            return papers
+
+        # Collect DOIs that need enrichment.
+        to_enrich: list[tuple[int, str]] = []
+        for i, paper in enumerate(papers):
+            if paper.arxiv_id:
+                continue
+            # Also check identity.arxiv_id
+            if paper.identity and paper.identity.arxiv_id:
+                paper.arxiv_id = paper.identity.arxiv_id
+                continue
+            if paper.doi:
+                to_enrich.append((i, paper.doi))
+
+        if not to_enrich:
+            logger.info(
+                f"[{request_id}] Stage 7b: no papers need arXiv enrichment"
+            )
+            return papers
+
+        enriched_count = 0
+        sem = asyncio.Semaphore(5)  # limit concurrent CrossRef API calls
+
+        async def _lookup(idx: int, doi: str) -> None:
+            nonlocal enriched_count
+            async with sem:
+                try:
+                    cr_paper = await crossref_provider.get_paper(doi)
+                    if cr_paper and cr_paper.arxiv_id:
+                        papers[idx].arxiv_id = cr_paper.arxiv_id
+                        if papers[idx].identity:
+                            papers[idx].identity.arxiv_id = cr_paper.arxiv_id
+                        enriched_count += 1
+                except Exception as e:
+                    logger.debug(
+                        f"[{request_id}] Stage 7b: CrossRef lookup "
+                        f"failed for DOI {doi}: {e}"
+                    )
+
+        await asyncio.gather(
+            *[_lookup(idx, doi) for idx, doi in to_enrich],
+            return_exceptions=True,
+        )
+
+        logger.info(
+            f"[{request_id}] Stage 7b: enriched {enriched_count}/"
+            f"{len(to_enrich)} papers with arXiv IDs"
+        )
+        return papers
 
     async def _stage8_embedding_ranking(
         self,

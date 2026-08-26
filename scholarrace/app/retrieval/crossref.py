@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from app.config import get_settings
 from app.models.paper import Paper, PaperIdentity, PaperList
-from app.retrieval.base import BaseSearchProvider
+from app.retrieval.base import BaseSearchProvider, filter_papers_by_year
 from app.utils.http_client import HttpClient
 
 logger = logging.getLogger(__name__)
@@ -85,15 +85,31 @@ class CrossrefProvider(BaseSearchProvider):
     def source_name(self) -> str:
         return "crossref"
 
-    async def search(self, query: str, max_results: int = 50) -> PaperList:
-        """Search CrossRef for papers matching the query."""
+    async def search(
+        self,
+        query: str,
+        max_results: int = 50,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
+    ) -> PaperList:
+        """Search CrossRef for papers matching the query.
+
+        If year_start/year_end are provided, uses API-level date filtering
+        via ``filter=from-pub-date,until-pub-date``.
+        """
         if self._is_test:
             return self._mock_search(query, max_results)
 
         max_results = min(max_results, self.max_results)
+        filters = ["type:journal-article"]
+        if year_start is not None:
+            filters.append(f"from-pub-date:{year_start}-01-01")
+        if year_end is not None:
+            filters.append(f"until-pub-date:{year_end}-12-31")
         params = {
             "query": query,
             "rows": min(max_results, 100),
+            "filter": ",".join(filters),
             "select": "DOI,title,abstract,author,published,container-title,subject,URL,link,is-referenced-by-count,ISSN,type,publisher",
         }
         headers = {
@@ -121,6 +137,9 @@ class CrossrefProvider(BaseSearchProvider):
                 if paper:
                     papers.append(paper)
 
+            # Defensive: also filter at result level
+            if year_start is not None or year_end is not None:
+                papers = filter_papers_by_year(papers, year_start, year_end)
             return PaperList(papers=papers, source=self.source_name)
         except Exception as e:
             logger.error(f"CrossRef search failed: {e}")
@@ -202,12 +221,38 @@ class CrossrefProvider(BaseSearchProvider):
             # Fields of study (subjects in CrossRef)
             fields = item.get("subject", []) or []
 
-            # arXiv ID extraction from DOI
+            # arXiv ID extraction — try DOI, URL, and link fields.
             arxiv_id = None
-            if doi and "arxiv" in doi.lower():
-                m = re.search(r"arxiv\.(\d+\.\d+|[a-z\-]+/\d+\.\d+)", doi, re.IGNORECASE)
+            arxiv_url_pattern = re.compile(
+                r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5}|[a-z\-]+/\d{4}\.\d{1,5})"
+            )
+
+            def _extract_arxiv_id(s: str) -> Optional[str]:
+                if not s:
+                    return None
+                m = arxiv_url_pattern.search(s)
+                return m.group(1) if m else None
+
+            # 1) DOI itself may be an arXiv DOI (10.48550/arXiv.2401.12345)
+            if doi:
+                m = re.search(
+                    r"arxiv\.(\d{4}\.\d{4,5}|[a-z\-]+/\d{4}\.\d{1,5})",
+                    doi,
+                    re.IGNORECASE,
+                )
                 if m:
                     arxiv_id = m.group(1)
+
+            # 2) URL field
+            if not arxiv_id:
+                arxiv_id = _extract_arxiv_id(url)
+
+            # 3) link list (PDF / landing pages)
+            if not arxiv_id:
+                for link in links:
+                    arxiv_id = _extract_arxiv_id(link.get("URL", ""))
+                    if arxiv_id:
+                        break
 
             identity = PaperIdentity(
                 doi=doi or None,

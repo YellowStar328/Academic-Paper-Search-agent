@@ -9,13 +9,14 @@ In test mode (APP_ENV=test), falls back to mock data for unit tests.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date
 from typing import Optional
 from uuid import uuid4
 
 from app.config import get_settings
 from app.models.paper import Paper, PaperIdentity, PaperList
-from app.retrieval.base import BaseSearchProvider
+from app.retrieval.base import BaseSearchProvider, filter_papers_by_year
 from app.utils.http_client import HttpClient
 
 logger = logging.getLogger(__name__)
@@ -83,10 +84,23 @@ class OpenAlexProvider(BaseSearchProvider):
     def source_name(self) -> str:
         return "openalex"
 
-    async def search(self, query: str, max_results: int = 50) -> PaperList:
-        """Search OpenAlex for papers matching the query."""
+    async def search(
+        self,
+        query: str,
+        max_results: int = 50,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
+    ) -> PaperList:
+        """Search OpenAlex for papers matching the query.
+
+        If year_start/year_end are provided, uses API-level date filtering
+        via ``from_publication_date`` / ``to_publication_date``.
+        """
         if self._is_test:
-            return self._mock_search(query, max_results)
+            papers = self._mock_search(query, max_results).papers
+            if year_start is not None or year_end is not None:
+                papers = filter_papers_by_year(papers, year_start, year_end)
+            return PaperList(papers=papers, source=self.source_name)
 
         max_results = min(max_results, self.max_results)
         params = {
@@ -94,6 +108,15 @@ class OpenAlexProvider(BaseSearchProvider):
             "per-page": min(max_results, 200),
             "mailto": self.email,
         }
+        # OpenAlex requires date-range filters inside the `filter` param,
+        # e.g. filter=from_publication_date:2020-01-01,to_publication_date:2025-12-31
+        filters = []
+        if year_start is not None:
+            filters.append(f"from_publication_date:{year_start}-01-01")
+        if year_end is not None:
+            filters.append(f"to_publication_date:{year_end}-12-31")
+        if filters:
+            params["filter"] = ",".join(filters)
 
         try:
             response = await self._http_client.get(
@@ -114,6 +137,9 @@ class OpenAlexProvider(BaseSearchProvider):
                 if paper:
                     papers.append(paper)
 
+            # Defensive: also filter at result level
+            if year_start is not None or year_end is not None:
+                papers = filter_papers_by_year(papers, year_start, year_end)
             return PaperList(papers=papers, source=self.source_name)
         except Exception as e:
             logger.error(f"OpenAlex search failed: {e}")
@@ -206,20 +232,48 @@ class OpenAlexProvider(BaseSearchProvider):
                 if name and name not in fields:
                     fields.append(name)
 
-            # arXiv ID from ids
-            ids = item.get("ids") or {}
-            arxiv_id = ids.get("openalex")  # fallback
-            # Try to extract arxiv from external locations
+            # arXiv ID — extract from any arXiv URL across locations /
+            # best_oa_location / pdf_url.  Never use the OpenAlex ID as a
+            # fallback (different identifier space).
+            arxiv_id = None
+            arxiv_url_pattern = re.compile(
+                r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5}|[a-z\-]+/\d{4}\.\d{1,5})"
+            )
+
+            def _extract_arxiv_id(url_or_path: str) -> Optional[str]:
+                if not url_or_path:
+                    return None
+                m = arxiv_url_pattern.search(url_or_path)
+                return m.group(1) if m else None
+
+            # 1) best_oa_location
+            if best_oa:
+                for key in ("landing_page_url", "pdf_url"):
+                    aid = _extract_arxiv_id(best_oa.get(key, ""))
+                    if aid:
+                        arxiv_id = aid
+                        break
+
+            # 2) locations list
             if not arxiv_id:
                 for loc in item.get("locations", []):
-                    landing = loc.get("landing_page_url", "") or ""
-                    if "arxiv.org" in landing:
-                        import re
-
-                        m = re.search(r"arxiv\.org/(?:abs|pdf)/(\d+\.\d+|[a-z\-]+/\d+\.\d+)", landing)
-                        if m:
-                            arxiv_id = m.group(1)
+                    for key in ("landing_page_url", "pdf_url"):
+                        aid = _extract_arxiv_id(loc.get(key, ""))
+                        if aid:
+                            arxiv_id = aid
                             break
+                    if arxiv_id:
+                        break
+
+            # 3) DOI itself may be an arXiv DOI (10.48550/arXiv.2401.12345)
+            if not arxiv_id and doi:
+                m = re.search(
+                    r"arxiv\.(\d{4}\.\d{4,5}|[a-z\-]+/\d{4}\.\d{1,5})",
+                    doi,
+                    re.IGNORECASE,
+                )
+                if m:
+                    arxiv_id = m.group(1)
 
             identity = PaperIdentity(
                 doi=doi,

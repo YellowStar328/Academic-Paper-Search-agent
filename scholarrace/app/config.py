@@ -83,12 +83,15 @@ class Settings(BaseSettings):
     embedding_top_k: int = 100
     embedding_dim: int = 256
     embedding_backend: Literal["fake", "api"] = "fake"
+    embedding_api_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    embedding_api_key: str = ""
+    embedding_api_model: str = "qwen2.5-vl-embedding"
 
     # Ranking Weights
-    w_relevance: float = 0.35
-    w_authority: float = 0.15
-    w_recency: float = 0.15
-    w_citation: float = 0.15
+    w_relevance: float = 0.40
+    w_authority: float = 0.20
+    w_recency: float = 0.0       # disabled: recency hurt benchmark recall
+    w_citation: float = 0.20
     w_diversity: float = 0.15
     w_redundancy: float = 0.05
     mmr_lambda: float = 0.7
@@ -100,6 +103,18 @@ class Settings(BaseSettings):
     thompson_initial_alpha: float = 1.0
     thompson_initial_beta: float = 1.0
     thompson_total_budget: int = 50
+
+    # Paper Judge batching: how many papers to evaluate per STRONG call.
+    # 50 papers / 10 per batch = 5 calls (vs 50 calls before).
+    paper_batch_size: int = 10
+
+    # Use STRONG model for candidate query judging (Stage 3).
+    # Default False: use agent cross-evaluation (0 STRONG calls).
+    use_strong_judge: bool = False
+
+    # Use STRONG model for query refinement (Stage 5).
+    # Default False: use lightweight agent (Qwen) instead of STRONG.
+    use_strong_refiner: bool = False
 
     # Citation Expansion
     citation_expansion_depth: int = 1

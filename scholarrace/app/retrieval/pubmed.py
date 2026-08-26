@@ -6,7 +6,7 @@ from uuid import uuid4
 from typing import Optional
 
 from app.models.paper import Paper, PaperIdentity, PaperList
-from app.retrieval.base import BaseSearchProvider
+from app.retrieval.base import BaseSearchProvider, filter_papers_by_year
 
 _MOCK_PAPERS = [
     Paper(
@@ -58,7 +58,13 @@ class PubMedProvider(BaseSearchProvider):
     def source_name(self) -> str:
         return "pubmed"
 
-    async def search(self, query: str, max_results: int = 50) -> PaperList:
+    async def search(
+        self,
+        query: str,
+        max_results: int = 50,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
+    ) -> PaperList:
         query_lower = query.lower()
         keywords = query_lower.split()
         matched = []
@@ -68,7 +74,10 @@ class PubMedProvider(BaseSearchProvider):
                 matched.append(paper)
         if not matched:
             matched = list(_MOCK_PAPERS)
-        return PaperList(papers=matched[:max_results], source=self.source_name)
+        papers = matched[:max_results]
+        if year_start is not None or year_end is not None:
+            papers = filter_papers_by_year(papers, year_start, year_end)
+        return PaperList(papers=papers, source=self.source_name)
 
     async def get_paper(self, paper_id: str) -> Optional[Paper]:
         for paper in _MOCK_PAPERS:

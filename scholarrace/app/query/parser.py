@@ -54,7 +54,12 @@ Options: {options_json}"""
 
 
 class QueryParser:
-    """Parse natural language queries into structured SearchQuery objects."""
+    """Parse natural language queries into structured SearchQuery objects.
+
+    Token-saving strategy: rule-based parsing is the default path (0 STRONG
+    calls). The LLM is only invoked when ``use_llm=True`` is explicitly
+    requested by the caller (e.g., for complex multi-constraint queries).
+    """
 
     def __init__(self, provider: Optional[LLMProvider] = None):
         self._provider = provider
@@ -73,14 +78,26 @@ class QueryParser:
                 self._provider = create_strong_judge_provider()
         return self._provider
 
-    async def parse(self, topic: str, options: Optional[SearchOptions] = None) -> SearchQuery:
+    async def parse(
+        self,
+        topic: str,
+        options: Optional[SearchOptions] = None,
+        use_llm: bool = False,
+    ) -> SearchQuery:
         """Parse a natural language topic into a structured SearchQuery.
 
-        Falls back to rule-based parsing if LLM fails.
+        By default uses rule-based parsing (0 STRONG tokens). Set
+        ``use_llm=True`` to use the LLM, which costs ~800 tokens but
+        may produce richer semantic decomposition for complex queries.
         """
         if options is None:
             options = SearchOptions()
 
+        # Default: rule-based parsing (0 STRONG calls)
+        if not use_llm:
+            return self._rule_based_parse(topic, options)
+
+        # Optional: LLM-based parsing
         prompt = QUERY_PARSE_USER_TEMPLATE.format(
             topic=topic,
             options_json=options.model_dump_json(),

@@ -2,6 +2,11 @@
 
 arXiv API is free and requires no API key.
 API docs: https://info.arxiv.org/help/api/index.html
+
+NOTE: arXiv API expects field-specific search syntax (e.g. ``all:"keyword" AND ti:"keyword"``),
+not natural-language sentences. The pipeline is expected to use a strong LLM to refine
+queries before calling this provider. If a raw sentence is passed, we fall back to a
+simple keyword extraction to avoid garbage results.
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ from xml.etree import ElementTree as ET
 
 from app.config import get_settings
 from app.models.paper import Paper, PaperIdentity, PaperList
-from app.retrieval.base import BaseSearchProvider
+from app.retrieval.base import BaseSearchProvider, filter_papers_by_year
 from app.utils.http_client import HttpClient
 
 logger = logging.getLogger(__name__)
@@ -23,6 +28,83 @@ logger = logging.getLogger(__name__)
 # arXiv Atom XML namespaces
 ATOM_NS = "http://www.w3.org/2005/Atom"
 ARXIV_NS = "http://arxiv.org/schemas/atom"
+
+# Common English stop words — only used as a fallback when no LLM refinement is available
+_STOP_WORDS = frozenset(
+    {
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "must", "shall", "can", "need", "dare",
+        "ought", "used", "to", "of", "in", "on", "at", "by", "for", "with",
+        "about", "against", "between", "into", "through", "during", "before",
+        "after", "above", "below", "from", "up", "down", "out", "off",
+        "over", "under", "again", "further", "then", "once", "here",
+        "there", "when", "where", "why", "how", "all", "both", "each",
+        "few", "more", "most", "other", "some", "such", "no", "nor",
+        "not", "only", "own", "same", "so", "than", "too", "very", "s",
+        "t", "just", "don", "now", "i", "me", "my", "myself", "we",
+        "our", "ours", "ourselves", "you", "your", "yours", "yourself",
+        "yourselves", "he", "him", "his", "himself", "she", "her", "hers",
+        "herself", "it", "its", "itself", "they", "them", "their",
+        "theirs", "themselves", "what", "which", "who", "whom", "this",
+        "that", "these", "those", "am", "if", "or", "and", "as", "until",
+        "while", "because", "though", "although", "even", "give",
+        "gives", "gave", "given", "giving", "show", "shows", "showed",
+        "shown", "showing", "paper", "papers", "find", "finds", "found",
+        "finding", "use", "uses", "using", "result", "results",
+        "better", "best", "good", "well", "also", "but",
+    }
+)
+
+
+def _fallback_keyword_query(query: str) -> str:
+    """Fallback: simple keyword extraction when no LLM refinement is available.
+
+    This is a last-resort heuristic — the pipeline should normally use
+    QueryRefiner (strong LLM) to generate proper arXiv search syntax.
+    """
+    cleaned = re.sub(r"[^\w\s\-]", " ", query)
+    tokens = cleaned.split()
+    keywords = []
+    for t in tokens:
+        t_lower = t.lower().strip("-")
+        if len(t_lower) >= 3 and t_lower not in _STOP_WORDS and t_lower.isalpha():
+            keywords.append(t_lower)
+        elif len(t_lower) >= 4 and any(c.isdigit() for c in t):
+            keywords.append(t_lower)
+
+    seen = set()
+    unique = []
+    for k in keywords:
+        if k not in seen:
+            seen.add(k)
+            unique.append(k)
+
+    if not unique:
+        return f"all:{query}"
+
+    top = unique[:6]
+    return " AND ".join(f'all:"{k}"' for k in top)
+
+
+def _looks_like_arxiv_syntax(query: str) -> bool:
+    """Check if the query is already in arXiv field-specific syntax.
+
+    Examples of arXiv syntax: all:"keyword" AND ti:"keyword", abs:transformer, etc.
+    """
+    # Contains field operators like all:, ti:, abs:, au:, cat:
+    return bool(re.search(r'\b(all|ti|abs|au|cat|sr):\s*"?', query))
+
+
+def _build_arxiv_search_query(query: str) -> str:
+    """Build an arXiv API search_query string.
+
+    If the query is already in arXiv field-specific syntax (from LLM refinement),
+    use it directly. Otherwise, fall back to simple keyword extraction.
+    """
+    if _looks_like_arxiv_syntax(query):
+        return query
+    return _fallback_keyword_query(query)
 
 
 class ArxivProvider(BaseSearchProvider):
@@ -41,14 +123,24 @@ class ArxivProvider(BaseSearchProvider):
     def source_name(self) -> str:
         return "arxiv"
 
-    async def search(self, query: str, max_results: int = 50) -> PaperList:
+    async def search(
+        self,
+        query: str,
+        max_results: int = 50,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
+    ) -> PaperList:
         """Search arXiv for papers matching the query.
 
         Uses the arXiv API: http://export.arxiv.org/api/query
+        Converts natural-language queries into arXiv field-specific syntax.
+        If year_start/year_end are provided, results are filtered to that range.
         """
         max_results = min(max_results, self.max_results)
+        search_query = _build_arxiv_search_query(query)
+        logger.debug(f"arXiv search_query: {search_query[:200]}")
         params = {
-            "search_query": f"all:{query}",
+            "search_query": search_query,
             "start": 0,
             "max_results": max_results,
             "sortBy": "relevance",
@@ -64,6 +156,8 @@ class ArxivProvider(BaseSearchProvider):
                 return PaperList(source=self.source_name)
 
             papers = self._parse_atom_feed(response.text)
+            if year_start is not None or year_end is not None:
+                papers = filter_papers_by_year(papers, year_start, year_end)
             return PaperList(papers=papers, source=self.source_name)
         except Exception as e:
             logger.error(f"arXiv search failed: {e}")
