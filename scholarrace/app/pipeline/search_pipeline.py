@@ -200,6 +200,7 @@ class SearchPipeline:
         all_judge_results: list[PaperJudgeResult] = []
         best_round_ranked: list[PaperWithScores] = []
         best_round_judges: list[PaperJudgeResult] = []
+        best_round_candidates: list[JudgeResult] = []
         best_round_score: float = -1.0
         iterations_done = 0
         seen_paper_ids: set[str] = set()
@@ -273,6 +274,7 @@ class SearchPipeline:
                 best_round_score = round_score
                 best_round_ranked = ranked
                 best_round_judges = judge_results
+                best_round_candidates = judged
 
             logger.info(
                 f"[{iter_id}] Round {iteration + 1}: "
@@ -333,7 +335,8 @@ class SearchPipeline:
 
         # --- Thompson feedback: compute reward and update state ---
         await self._update_thompson_reward(
-            search_query, ranked, request_id
+            search_query, ranked, request_id,
+            judged_candidates=best_round_candidates,
         )
 
         # Stage 12: Research graph
@@ -1056,13 +1059,22 @@ class SearchPipeline:
         search_query: SearchQuery,
         ranked: list[PaperWithScores],
         request_id: str,
+        judged_candidates: list[JudgeResult] | None = None,
     ) -> None:
-        """Compute reward from search results and update Thompson state.
+        """Compute per-model reward from search results and update Thompson state.
 
-        Reward = weighted combination of:
+        Global reward = weighted combination of:
         - Number of highly relevant papers (relevance_score >= threshold)
         - Average relevance score
         - Diversity of top-k papers
+
+        Per-model reward attribution:
+        - If judged_candidates (stage-3 JudgeResults) are available, each
+          model's reward is scaled by the relative quality of the candidate
+          queries it proposed (avg judge score / global avg judge score).
+          This ensures models that proposed better queries receive higher
+          rewards, closing the Thompson feedback loop correctly.
+        - Without judged_candidates, falls back to uniform reward (legacy).
 
         This closes the Thompson sampling feedback loop.
         """
@@ -1087,26 +1099,65 @@ class SearchPipeline:
                     top_authors.add(pws.paper.authors[0].lower())
             diversity = len(top_authors) / min(len(ranked), 10)
 
-            reward = (
+            global_reward = (
                 min(highly_relevant / 10.0, 1.0) * 0.5
                 + avg_relevance * 0.3
                 + diversity * 0.2
             )
 
-            # Update Thompson state for each model
             model_names = self._coordinator.model_names
-            model_rewards = {
-                name: reward for name in model_names
+
+            # Per-model reward attribution via candidate query quality
+            per_model_rewards: dict[str, float] = {}
+            if judged_candidates:
+                judge_rewards = self._thompson.compute_reward_from_judge(
+                    judged_candidates
+                )
+                if judge_rewards:
+                    # Normalise: scale global reward by relative query quality
+                    global_avg = sum(judge_rewards.values()) / len(judge_rewards) if judge_rewards else 0.5
+                    if global_avg > 0:
+                        for name in model_names:
+                            model_judge = judge_rewards.get(name)
+                            if model_judge is not None:
+                                # Scale global reward by relative query quality
+                                per_model_rewards[name] = global_reward * (
+                                    model_judge / global_avg
+                                )
+                            else:
+                                per_model_rewards[name] = global_reward * 0.5
+                    else:
+                        per_model_rewards = {
+                            name: global_reward for name in model_names
+                        }
+                else:
+                    per_model_rewards = {
+                        name: global_reward for name in model_names
+                    }
+            else:
+                per_model_rewards = {
+                    name: global_reward for name in model_names
+                }
+
+            # Clamp rewards to [0, 1]
+            per_model_rewards = {
+                name: max(0.0, min(1.0, r))
+                for name, r in per_model_rewards.items()
             }
+
             self._thompson.update_state_batch(
-                model_rewards=model_rewards,
+                model_rewards=per_model_rewards,
                 domain=search_query.domain,
                 query_type=search_query.query_type,
             )
 
+            reward_str = ", ".join(
+                f"{m}={r:.3f}" for m, r in per_model_rewards.items()
+            )
             logger.info(
-                f"[{request_id}] Thompson reward={reward:.3f} "
-                f"(highly_relevant={highly_relevant}, "
+                f"[{request_id}] Thompson per-model rewards: {reward_str} "
+                f"(global={global_reward:.3f}, "
+                f"highly_relevant={highly_relevant}, "
                 f"avg_rel={avg_relevance:.3f}, div={diversity:.3f})"
             )
         except Exception as e:
@@ -1222,6 +1273,76 @@ class SearchPipeline:
 
         # Metrics.
         self._stage14_metrics(result, request_id, start_time)
+
+        # --- Thompson feedback: per-model reward from worker reports ---
+        if self._thompson is not None and final_selection:
+            try:
+                model_names = self._coordinator.model_names
+
+                # Global reward from final selected papers.
+                rel_floor = getattr(
+                    self._settings, "relevance_floor", 0.30
+                )
+                highly_relevant = sum(
+                    1 for _, score, _, _ in final_selection
+                    if score >= rel_floor
+                )
+                avg_relevance = sum(
+                    score for _, score, _, _ in final_selection
+                ) / len(final_selection)
+                global_reward = (
+                    min(highly_relevant / 10.0, 1.0) * 0.5
+                    + avg_relevance * 0.5
+                )
+
+                # Per-model reward: each model's endorsed papers' avg score.
+                model_scores: dict[str, list[float]] = {
+                    name: [] for name in model_names
+                }
+                for paper, score, reasoning, endorsed in final_selection:
+                    for model in endorsed:
+                        if model in model_scores:
+                            model_scores[model].append(score)
+
+                per_model_rewards: dict[str, float] = {}
+                for name in model_names:
+                    scores = model_scores.get(name, [])
+                    if scores:
+                        model_avg = sum(scores) / len(scores)
+                        # Scale global reward by relative endorsed quality.
+                        per_model_rewards[name] = global_reward * (
+                            model_avg / avg_relevance
+                            if avg_relevance > 0 else 1.0
+                        )
+                    else:
+                        # No endorsed papers → low reward (encourages exploration).
+                        per_model_rewards[name] = global_reward * 0.1
+
+                # Clamp to [0, 1].
+                per_model_rewards = {
+                    name: max(0.0, min(1.0, r))
+                    for name, r in per_model_rewards.items()
+                }
+
+                self._thompson.update_state_batch(
+                    model_rewards=per_model_rewards,
+                    domain=search_query.domain,
+                    query_type=search_query.query_type,
+                )
+
+                reward_str = ", ".join(
+                    f"{m}={r:.3f}" for m, r in per_model_rewards.items()
+                )
+                logger.info(
+                    f"[{request_id}] Thompson worker per-model rewards: {reward_str} "
+                    f"(global={global_reward:.3f}, "
+                    f"highly_relevant={highly_relevant}, "
+                    f"avg_rel={avg_relevance:.3f})"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{request_id}] Thompson worker reward update failed: {e}"
+                )
 
         logger.info(
             f"[{request_id}] Worker pipeline completed in "
