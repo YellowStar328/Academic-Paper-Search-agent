@@ -24,6 +24,8 @@ class PaperWithScores(BaseModel):
     final_score: float = 0.0
     embedding_similarity: Optional[float] = None
     judge_reasoning: str = ""
+    relevance_tier: str = ""
+    """Relevance grade: 'highly_relevant', 'relevant', 'partially_relevant', or 'marginally_relevant'."""
 
 
 class GraphNode(BaseModel):
@@ -116,3 +118,7 @@ class SearchSummary(BaseModel):
     top_paper_title: Optional[str] = None
     clusters_count: int = 0
     timeline_span: Optional[str] = None
+    natural_language_summary: str = ""
+    """LLM-generated natural language summary of search results."""
+    search_iterations: int = 1
+    """Number of search iterations performed."""

@@ -97,6 +97,20 @@ class Settings(BaseSettings):
     mmr_lambda: float = 0.7
     final_top_k: int = 20
 
+    # Relevance tier thresholds for qualitative grading
+    relevance_thresholds: dict = Field(
+        default_factory=lambda: {
+            "highly_relevant": 0.65,
+            "relevant": 0.40,
+            "partially_relevant": 0.20,
+        }
+    )
+
+    # Iterative search loop
+    max_search_iterations: int = 3
+    min_papers_threshold: int = 10
+    relevance_floor: float = 0.30
+
     # Thompson Sampling
     thompson_exploration_floor: float = 0.10
     thompson_batch_size: int = 16

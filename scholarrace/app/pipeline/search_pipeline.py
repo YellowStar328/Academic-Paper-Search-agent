@@ -40,7 +40,13 @@ from app.config import get_settings, Settings
 from app.embedding.encoder import EmbeddingEncoder, FakeEncoder
 from app.embedding.reranker import EmbeddingReranker
 from app.graph.research_graph import ResearchGraphBuilder
-from app.models.candidate import CandidateQuery, JudgeResult, PaperJudgeResult
+from app.models.candidate import (
+    AgentPaperReport,
+    AgentReport,
+    CandidateQuery,
+    JudgeResult,
+    PaperJudgeResult,
+)
 from app.models.paper import Paper, PaperList
 from app.models.query import SearchQuery, UserQuery
 from app.models.result import (
@@ -110,6 +116,7 @@ class SearchPipeline:
         settings: Optional[Settings] = None,
         year_start: Optional[int] = None,
         year_end: Optional[int] = None,
+        worker_mode: bool = False,
     ):
         self._parser = query_parser
         self._coordinator = coordinator
@@ -134,6 +141,10 @@ class SearchPipeline:
         # When set, all provider search calls are restricted to this range.
         self._year_start = year_start
         self._year_end = year_end
+        # Worker mode: each agent (Qwen/DeepSeek/GLM) independently
+        # performs search + judge + report, then the strong model
+        # reviews all reports and makes the final selection.
+        self._worker_mode = worker_mode
 
     async def run(self, user_query: UserQuery) -> SearchResult:
         """Execute the full 14-stage pipeline and return SearchResult."""
@@ -170,46 +181,159 @@ class SearchPipeline:
             search_query, request_id
         )
 
-        # Stage 3: Strong judge
-        judged = await self._stage3_strong_judge(
-            candidates, search_query, request_id
-        )
+        if self._worker_mode:
+            # === Worker mode: agents do their own search + judge + report ===
+            return await self._run_worker_mode(
+                search_query, candidates, user_query, request_id, start_time
+            )
 
-        # Stage 4: Thompson budget allocation
-        budget = await self._stage4_thompson_budget(
-            search_query, request_id
-        )
+        # === Iterative search loop ===
+        # Stage 2-11 are repeated up to max_search_iterations.
+        # After each round, if the number of highly-relevant papers
+        # is below min_papers_threshold, the query is refined and
+        # another search round is performed.
+        max_iters = getattr(self._settings, "max_search_iterations", 3)
+        min_papers = getattr(self._settings, "min_papers_threshold", 10)
+        rel_floor = getattr(self._settings, "relevance_floor", 0.30)
 
-        # Stage 5: Multi-source retrieval
-        papers = await self._stage5_retrieval(
-            judged, search_query, budget, request_id
-        )
+        all_ranked: list[PaperWithScores] = []
+        all_judge_results: list[PaperJudgeResult] = []
+        best_round_ranked: list[PaperWithScores] = []
+        best_round_judges: list[PaperJudgeResult] = []
+        best_round_score: float = -1.0
+        iterations_done = 0
+        seen_paper_ids: set[str] = set()
 
-        # Stage 6: Citation expansion
-        papers = await self._stage6_citation_expansion(
-            papers, search_query, request_id
-        )
+        for iteration in range(max_iters):
+            iter_id = f"{request_id}-iter{iteration}"
+            logger.info(
+                f"[{iter_id}] Search iteration {iteration + 1}/{max_iters}"
+            )
 
-        # Stage 7: Deduplication
-        papers = await self._stage7_dedup(papers, request_id)
+            # Stage 3: Strong judge
+            judged = await self._stage3_strong_judge(
+                candidates, search_query, iter_id
+            )
 
-        # Stage 7b: arXiv ID enrichment via CrossRef DOI lookup
-        papers = await self._stage7b_arxiv_enrichment(papers, request_id)
+            # Stage 4: Thompson budget allocation
+            budget = await self._stage4_thompson_budget(
+                search_query, iter_id
+            )
 
-        # Stage 8: Embedding coarse ranking
-        papers = await self._stage8_embedding_ranking(
-            papers, search_query, request_id
-        )
+            # Stage 5: Multi-source retrieval
+            papers = await self._stage5_retrieval(
+                judged, search_query, budget, iter_id
+            )
 
-        # Stage 9: LLM paper judging
-        judge_results = await self._stage9_paper_judging(
-            papers, search_query, request_id
-        )
+            # Stage 6: Citation expansion
+            papers = await self._stage6_citation_expansion(
+                papers, search_query, iter_id
+            )
 
-        # Stage 10: Authority scoring (done inside FinalRanker)
-        # Stage 11: Final ranking + MMR
-        ranked = await self._stage10_11_final_ranking(
-            papers, judge_results, search_query, request_id
+            # Stage 7: Deduplication
+            papers = await self._stage7_dedup(papers, iter_id)
+
+            # Stage 7b: arXiv ID enrichment via CrossRef DOI lookup
+            papers = await self._stage7b_arxiv_enrichment(papers, iter_id)
+
+            # Stage 8: Embedding coarse ranking
+            papers = await self._stage8_embedding_ranking(
+                papers, search_query, iter_id
+            )
+
+            # Stage 9: LLM paper judging
+            judge_results = await self._stage9_paper_judging(
+                papers, search_query, iter_id
+            )
+
+            # Stage 10-11: Final ranking + MMR
+            ranked = await self._stage10_11_final_ranking(
+                papers, judge_results, search_query, iter_id
+            )
+
+            iterations_done = iteration + 1
+
+            # Accumulate non-duplicate papers across iterations
+            for pws in ranked:
+                pid = pws.paper.paper_id or pws.paper.title
+                if pid not in seen_paper_ids:
+                    seen_paper_ids.add(pid)
+                    all_ranked.append(pws)
+            all_judge_results.extend(judge_results)
+
+            # Evaluate round quality
+            relevant_count = sum(
+                1 for p in ranked if p.relevance_score >= rel_floor
+            )
+            round_score = (
+                relevant_count
+                + sum(p.relevance_score for p in ranked) * 0.1
+            )
+            if round_score > best_round_score:
+                best_round_score = round_score
+                best_round_ranked = ranked
+                best_round_judges = judge_results
+
+            logger.info(
+                f"[{iter_id}] Round {iteration + 1}: "
+                f"{len(ranked)} ranked, {relevant_count} relevant "
+                f"(score={round_score:.2f})"
+            )
+
+            # Convergence check
+            if relevant_count >= min_papers:
+                logger.info(
+                    f"[{iter_id}] Sufficient relevant papers "
+                    f"({relevant_count} >= {min_papers}), stopping"
+                )
+                break
+
+            if iteration < max_iters - 1:
+                # --- Dynamic query refinement ---
+                # Use LLM to analyze the gap and suggest new keywords
+                new_query = await self._refine_query_for_next_round(
+                    search_query, ranked, iter_id
+                )
+                if new_query:
+                    search_query = new_query
+                    # Re-generate candidates for the refined query
+                    candidates = await self._stage2_multi_agent_generation(
+                        search_query, iter_id
+                    )
+                else:
+                    logger.info(
+                        f"[{iter_id}] No query refinement suggested, "
+                        f"stopping"
+                    )
+                    break
+
+        # Use the best round's results, supplemented with any unique
+        # papers from other rounds
+        final_ranked = best_round_ranked.copy()
+        best_ids = {
+            pws.paper.paper_id or pws.paper.title
+            for pws in best_round_ranked
+        }
+        for pws in all_ranked:
+            pid = pws.paper.paper_id or pws.paper.title
+            if pid not in best_ids:
+                final_ranked.append(pws)
+                best_ids.add(pid)
+        # Re-rank the merged set
+        if len(final_ranked) > len(best_round_ranked):
+            final_ranked = self._final_ranker.rank(
+                [pws.paper for pws in final_ranked],
+                search_query.semantic_core,
+                judge_results=all_judge_results if all_judge_results else None,
+                top_k=search_query.options.top_k,
+            )
+
+        ranked = final_ranked
+        judge_results = best_round_judges
+
+        # --- Thompson feedback: compute reward and update state ---
+        await self._update_thompson_reward(
+            search_query, ranked, request_id
         )
 
         # Stage 12: Research graph
@@ -218,9 +342,10 @@ class SearchPipeline:
         )
 
         # Stage 13: Result assembly
-        result = self._stage13_assembly(
+        result = await self._stage13_assembly(
             ranked, graph, search_query, request_id, start_time
         )
+        result.summary.search_iterations = iterations_done
 
         # Stage 14: Metrics recording
         self._stage14_metrics(result, request_id, start_time)
@@ -244,10 +369,16 @@ class SearchPipeline:
     async def _stage1_query_understanding(
         self, user_query: UserQuery, request_id: str
     ) -> SearchQuery:
-        """Parse user query into structured SearchQuery."""
+        """Parse user query into structured SearchQuery.
+
+        Uses LLM-based parsing by default for richer semantic decomposition
+        (intent detection, keyword extraction, sub-query generation).
+        Falls back to rule-based parsing on LLM failure.
+        """
         try:
+            use_llm = not self._settings.is_test
             search_query = await self._parser.parse(
-                user_query.query, user_query.options
+                user_query.query, user_query.options, use_llm=use_llm
             )
             self._metrics.record_llm_call(self._parser.last_token_usage)
             self._metrics.record_model_used(self._parser.model_name)
@@ -462,12 +593,12 @@ class SearchPipeline:
         """
         try:
             source_name = getattr(provider, "source_name", "unknown")
-            paper_list = await provider.search(
-                query,
-                max_results=max_results,
-                year_start=self._year_start,
-                year_end=self._year_end,
-            )
+            kwargs: dict = {"max_results": max_results}
+            if self._year_start is not None:
+                kwargs["year_start"] = self._year_start
+            if self._year_end is not None:
+                kwargs["year_end"] = self._year_end
+            paper_list = await provider.search(query, **kwargs)
             self._metrics.record_source_used(source_name)
             return paper_list.papers
         except Exception as e:
@@ -696,6 +827,11 @@ class SearchPipeline:
         try:
             papers = [pws.paper for pws in ranked]
             graph = self._graph_builder.build(papers, ranked)
+            # LLM-based semantic topic labels for clusters
+            if graph.clusters:
+                await self._graph_builder.label_clusters_with_llm(
+                    graph.clusters, papers
+                )
             logger.info(
                 f"[{request_id}] Stage 12: graph with {len(graph.nodes)} "
                 f"nodes, {len(graph.clusters)} clusters"
@@ -705,7 +841,7 @@ class SearchPipeline:
             logger.error(f"[{request_id}] Stage 12 failed: {e}")
             return ResearchGraph()
 
-    def _stage13_assembly(
+    async def _stage13_assembly(
         self,
         ranked: list[PaperWithScores],
         graph: ResearchGraph,
@@ -716,6 +852,11 @@ class SearchPipeline:
         """Assemble final SearchResult."""
         latency_ms = (time.time() - start_time) * 1000
 
+        # Generate LLM natural-language summary
+        nl_summary = await self._generate_summary(
+            ranked, graph, search_query, request_id
+        )
+
         summary = SearchSummary(
             total_papers=len(ranked),
             query=search_query.original_query,
@@ -723,6 +864,7 @@ class SearchPipeline:
             intent=search_query.intent.value,
             top_paper_title=ranked[0].paper.title if ranked else None,
             clusters_count=len(graph.clusters),
+            natural_language_summary=nl_summary,
         )
 
         result = SearchResult(
@@ -737,6 +879,241 @@ class SearchPipeline:
 
         return result
 
+    async def _generate_summary(
+        self,
+        ranked: list[PaperWithScores],
+        graph: ResearchGraph,
+        search_query: SearchQuery,
+        request_id: str,
+    ) -> str:
+        """Generate a natural-language summary of search results via LLM.
+
+        Falls back to a template-based summary on LLM failure.
+        """
+        if not ranked:
+            return (
+                f"No papers found for query '{search_query.original_query}'. "
+                f"Consider refining the search terms."
+            )
+
+        # Build paper digest for LLM input
+        top_papers = ranked[:10]
+        paper_lines: list[str] = []
+        tier_counts: dict[str, int] = {}
+        for i, pws in enumerate(top_papers, 1):
+            tier = pws.relevance_tier or "unrated"
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
+            paper_lines.append(
+                f"{i}. [{tier}] {pws.paper.title} "
+                f"({pws.paper.year or 'N/A'}) "
+                f"citations={pws.paper.citation_count or 0} "
+                f"score={pws.final_score:.3f}"
+            )
+        papers_str = "\n".join(paper_lines)
+
+        cluster_lines: list[str] = []
+        for c in graph.clusters[:5]:
+            cluster_lines.append(f"- {c.label} ({len(c.paper_ids)} papers)")
+        clusters_str = "\n".join(cluster_lines) or "No clusters identified."
+
+        prompt = (
+            f"You are a research assistant. Summarize the following search results.\n\n"
+            f"Query: {search_query.original_query}\n"
+            f"Domain: {search_query.domain}\n"
+            f"Intent: {search_query.intent.value}\n"
+            f"Total papers found: {len(ranked)}\n"
+            f"Clusters:\n{clusters_str}\n\n"
+            f"Top papers:\n{papers_str}\n\n"
+            f"Write a concise summary (3-5 sentences) covering:\n"
+            f"1. What the search found overall\n"
+            f"2. Key themes/clusters\n"
+            f"3. Most relevant papers and why\n"
+            f"Respond in the same language as the query."
+        )
+
+        try:
+            from app.agents.qwen import QwenAgent
+
+            provider = QwenAgent().provider
+            resp = await provider.generate(
+                prompt=prompt,
+                system_prompt="You are a helpful research assistant.",
+                temperature=0.3,
+            )
+            self._metrics.record_llm_call(getattr(provider, "last_token_usage", 0))
+            self._metrics.record_model_used(provider.model_name)
+            return resp.content.strip()
+        except Exception as e:
+            logger.warning(
+                f"[{request_id}] Summary LLM failed: {e}, using template"
+            )
+            tier_str = ", ".join(
+                f"{k}: {v}" for k, v in tier_counts.items()
+            )
+            return (
+                f"Found {len(ranked)} papers for '{search_query.original_query}'. "
+                f"Top result: {ranked[0].paper.title} "
+                f"({ranked[0].paper.year or 'N/A'}). "
+                f"Relevance distribution: {tier_str}. "
+                f"Organized into {len(graph.clusters)} thematic clusters."
+            )
+
+    async def _refine_query_for_next_round(
+        self,
+        search_query: SearchQuery,
+        ranked: list[PaperWithScores],
+        request_id: str,
+    ) -> Optional[SearchQuery]:
+        """Dynamically refine the search query for the next iteration.
+
+        Uses an LLM to analyze the current results and suggest:
+        - Broader/different keywords if too few relevant papers
+        - Alternative domain terminology
+        - Relaxed constraints (e.g. broader year range)
+        """
+        if not ranked:
+            # No results at all — try broadening the query
+            new_core = search_query.semantic_core
+            new_keywords = list(search_query.keywords) if search_query.keywords else []
+            # Add a broader fallback: use original query verbatim
+            return SearchQuery(
+                original_query=search_query.original_query,
+                semantic_core=new_core,
+                domain=search_query.domain,
+                intent=search_query.intent,
+                keywords=new_keywords,
+                hard_filters=search_query.hard_filters,
+                options=search_query.options,
+            )
+
+        # Build a summary of what was found
+        top_titles = [pws.paper.title for pws in ranked[:5]]
+        avg_rel = sum(p.relevance_score for p in ranked) / len(ranked)
+
+        prompt = (
+            f"You are a search strategist. The current search yielded "
+            f"{len(ranked)} papers with avg relevance {avg_rel:.2f}.\n\n"
+            f"Current query: {search_query.semantic_core}\n"
+            f"Domain: {search_query.domain}\n"
+            f"Keywords: {search_query.keywords}\n\n"
+            f"Top results found:\n"
+            + "\n".join(f"- {t}" for t in top_titles)
+            + "\n\nThe results are insufficient. Suggest a refined search "
+            "strategy. Return a JSON object with:\n"
+            '"semantic_core": "<refined core query>",\n'
+            '"keywords": ["<kw1>", "<kw2>", ...],\n'
+            '"domain": "<domain or unchanged>"\n'
+            "Respond with ONLY the JSON, no explanation."
+        )
+
+        try:
+            from app.agents.qwen import QwenAgent
+
+            provider = QwenAgent().provider
+            resp = await provider.generate(
+                prompt=prompt,
+                system_prompt="You are a search strategy assistant.",
+                temperature=0.4,
+            )
+            import json
+
+            # Parse JSON from response
+            content = resp.content.strip()
+            # Extract JSON from potential markdown code block
+            if "```" in content:
+                start = content.find("{")
+                end = content.rfind("}") + 1
+                content = content[start:end]
+            data = json.loads(content)
+
+            new_core = data.get("semantic_core", search_query.semantic_core)
+            new_keywords = data.get("keywords", search_query.keywords)
+            new_domain = data.get("domain", search_query.domain)
+
+            logger.info(
+                f"[{request_id}] Query refined: "
+                f"core='{new_core[:60]}', "
+                f"keywords={new_keywords[:3]}"
+            )
+
+            return SearchQuery(
+                original_query=search_query.original_query,
+                semantic_core=new_core,
+                domain=new_domain,
+                intent=search_query.intent,
+                keywords=new_keywords,
+                hard_filters=search_query.hard_filters,
+                options=search_query.options,
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{request_id}] Query refinement failed: {e}"
+            )
+            return None
+
+    async def _update_thompson_reward(
+        self,
+        search_query: SearchQuery,
+        ranked: list[PaperWithScores],
+        request_id: str,
+    ) -> None:
+        """Compute reward from search results and update Thompson state.
+
+        Reward = weighted combination of:
+        - Number of highly relevant papers (relevance_score >= threshold)
+        - Average relevance score
+        - Diversity of top-k papers
+
+        This closes the Thompson sampling feedback loop.
+        """
+        if self._thompson is None or not ranked:
+            return
+
+        try:
+            rel_floor = getattr(
+                self._settings, "relevance_floor", 0.30
+            )
+            highly_relevant = sum(
+                1 for p in ranked if p.relevance_score >= rel_floor
+            )
+            avg_relevance = sum(
+                p.relevance_score for p in ranked
+            ) / len(ranked)
+
+            # Diversity: count unique first-authors in top-10
+            top_authors = set()
+            for pws in ranked[:10]:
+                if pws.paper.authors:
+                    top_authors.add(pws.paper.authors[0].lower())
+            diversity = len(top_authors) / min(len(ranked), 10)
+
+            reward = (
+                min(highly_relevant / 10.0, 1.0) * 0.5
+                + avg_relevance * 0.3
+                + diversity * 0.2
+            )
+
+            # Update Thompson state for each model
+            model_names = self._coordinator.model_names
+            model_rewards = {
+                name: reward for name in model_names
+            }
+            self._thompson.update_state_batch(
+                model_rewards=model_rewards,
+                domain=search_query.domain,
+                query_type=search_query.query_type,
+            )
+
+            logger.info(
+                f"[{request_id}] Thompson reward={reward:.3f} "
+                f"(highly_relevant={highly_relevant}, "
+                f"avg_rel={avg_relevance:.3f}, div={diversity:.3f})"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{request_id}] Thompson reward update failed: {e}"
+            )
+
     def _stage14_metrics(
         self, result: SearchResult, request_id: str, start_time: float
     ) -> None:
@@ -748,3 +1125,112 @@ class SearchPipeline:
             f"llm_calls={m.llm_calls}, "
             f"tokens={m.token_usage}"
         )
+
+    # -----------------------------------------------------------------------
+    # Worker mode: agents do their own procurement + judging, strong model
+    # reviews all reports and makes the final selection.
+    # -----------------------------------------------------------------------
+
+    async def _run_worker_mode(
+        self,
+        search_query: SearchQuery,
+        candidates: list[CandidateQuery],
+        user_query: UserQuery,
+        request_id: str,
+        start_time: float,
+    ) -> SearchResult:
+        """Worker-mode flow: delegate procurement to agents, strong model reviews.
+
+        Flow:
+        1. Group candidates by agent model (from stage 2).
+        2. Inject providers into agents.
+        3. dispatch_and_collect → each agent searches + judges + reports.
+        4. Strong model reviews all 3 reports → final selection.
+        5. Dedup, citation expansion, graph, assembly (reuse existing stages).
+        """
+        # 2b. Inject providers so agents can dispatch retrieval themselves.
+        max_per = self._settings.max_per_source if hasattr(self._settings, "max_per_source") else 10
+        self._coordinator.inject_providers(self._providers, max_per_source=max_per)
+
+        # Group candidates by proposer model for dispatch.
+        candidates_per_agent: dict[str, list[CandidateQuery]] = {}
+        for c in candidates:
+            candidates_per_agent.setdefault(c.proposer_model, []).append(c)
+
+        # Dispatch each agent independently.
+        reports = await self._coordinator.dispatch_and_collect(
+            query=search_query,
+            candidates_per_agent=candidates_per_agent,
+            year_start=self._year_start,
+            year_end=self._year_end,
+        )
+        for rep in reports:
+            self._metrics.record_llm_call(rep.token_usage)
+            logger.info(
+                f"[{request_id}] Worker {rep.agent_model}: "
+                f"{len(rep.paper_reports)} papers, "
+                f"{rep.token_usage} tokens, "
+                f"{rep.latency_ms:.0f}ms"
+            )
+
+        # Strong model reviews all reports.
+        final_selection = await self._judge.review_agent_reports(
+            search_query, reports
+        )
+        self._metrics.record_llm_call(self._judge.last_token_usage)
+
+        papers = [p for p, _, _, _ in final_selection]
+        judge_results: list[PaperJudgeResult] = []
+        for paper, score, reasoning, endorsed in final_selection:
+            judge_results.append(
+                PaperJudgeResult(
+                    paper_id=paper.identity_key() or paper.title,
+                    relevance_score=score,
+                    reasoning=reasoning,
+                    key_findings=[f"endorsed by: {', '.join(endorsed)}"],
+                )
+            )
+
+        logger.info(
+            f"[{request_id}] Worker mode: strong model selected "
+            f"{len(papers)} papers from {sum(len(r.paper_reports) for r in reports)} "
+            f"candidates reported by {len(reports)} agents"
+        )
+
+        # Dedup (some agents may have found the same paper).
+        papers = await self._stage7_dedup(papers, request_id)
+
+        # Citation expansion (optional, reuse existing stage).
+        papers = await self._stage6_citation_expansion(
+            papers, search_query, request_id
+        )
+
+        # Final ranking + MMR (reuse existing stage).
+        ranked = await self._stage10_11_final_ranking(
+            papers, judge_results, search_query, request_id
+        )
+
+        # Research graph.
+        graph = await self._stage12_research_graph(
+            ranked, search_query, request_id
+        )
+
+        # Assembly.
+        result = await self._stage13_assembly(
+            ranked, graph, search_query, request_id, start_time
+        )
+
+        # Metrics.
+        self._stage14_metrics(result, request_id, start_time)
+
+        logger.info(
+            f"[{request_id}] Worker pipeline completed in "
+            f"{result.latency_ms:.0f}ms, "
+            f"{len(result.papers)} papers returned"
+        )
+
+        # Reset dynamic year filters.
+        self._year_start = None
+        self._year_end = None
+
+        return result

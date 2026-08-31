@@ -58,6 +58,22 @@ class MockLLMProvider:
         """Generate a deterministic mock response based on prompt content."""
         prompt_lower = prompt.lower()
 
+        # Strong model reviewing agent reports — must return "final_papers"
+        if "final_papers" in prompt_lower or "review these reports" in prompt_lower:
+            # Extract paper_id values from the reports JSON in the prompt
+            paper_ids = re.findall(r'"paper_id"\s*:\s*"([^"]+)"', prompt)
+            final_papers = [
+                {
+                    "paper_id": pid,
+                    "final_relevance_score": 0.8,
+                    "final_authority_score": 0.7,
+                    "final_reasoning": "Relevant and authoritative.",
+                    "endorsed_by": ["qwen", "deepseek", "glm"],
+                }
+                for pid in paper_ids
+            ]
+            return json.dumps({"final_papers": final_papers})
+
         # Paper relevance evaluation (most specific — must check before query judge)
         if "paper" in prompt_lower and ("relevance" in prompt_lower or "abstract" in prompt_lower or "paper title" in prompt_lower):
             return json.dumps({
@@ -84,19 +100,23 @@ class MockLLMProvider:
         # Candidate query generation — system prompts mention "candidates" and "strategist"
         if "candidates" in prompt_lower or "sub-quer" in prompt_lower or "generate search quer" in prompt_lower or "search strategist" in prompt_lower:
             topic = self._extract_topic(prompt)
+            # Extract real keywords (not stopwords) from the topic for better arXiv matching
+            kws = self._extract_keywords(topic)
+            # Build 2 candidate queries: keyword-focused + broader
+            kw_query = " ".join(kws[:5]) if kws else topic
             return json.dumps({
                 "candidates": [
                     {
-                        "query": f"{topic} survey",
-                        "rationale": "Broad survey perspective",
-                        "keywords": [topic],
-                        "logic": "OR",
+                        "query": kw_query,
+                        "rationale": "Keyword-focused search for precise matching",
+                        "keywords": kws[:5],
+                        "logic": "AND",
                     },
                     {
-                        "query": f"{topic} methods",
-                        "rationale": "Methodology focus",
-                        "keywords": [topic, "methods"],
-                        "logic": "AND",
+                        "query": f"{kws[0]} {kws[1]} survey" if len(kws) >= 2 else f"{topic} survey",
+                        "rationale": "Broader survey perspective",
+                        "keywords": [kws[0], kws[1]] if len(kws) >= 2 else [topic],
+                        "logic": "OR",
                     },
                 ]
             })
@@ -119,6 +139,10 @@ class MockLLMProvider:
 
     def _extract_topic(self, prompt: str) -> str:
         """Try to extract the main topic from the prompt."""
+        # Look for "Topic:" pattern (most reliable)
+        match = re.search(r"(?:topic|query|question)\s*:\s*(.+?)(?:\n|$)", prompt, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
         # Look for quoted text
         match = re.search(r'"([^"]+)"', prompt)
         if match:
@@ -151,11 +175,17 @@ class MockLLMProvider:
 
     def _extract_keywords(self, prompt: str) -> list[str]:
         """Extract keywords from prompt."""
-        # Simple: take significant words
+        # Extended stopwords
+        stop = {
+            "the", "this", "that", "with", "from", "your", "have", "been",
+            "could", "list", "provide", "mention", "works", "work", "paper",
+            "papers", "some", "related", "about", "which", "what", "studies",
+            "discuss", "effects", "mechanisms", "research", "study", "article",
+            "articles", "find", "describe", "explain", "introduce", "novel",
+        }
         words = re.findall(r"[a-z]{4,}", prompt.lower())
-        # Deduplicate and take top 5
         seen = []
         for w in words:
-            if w not in seen and w not in ("the", "this", "that", "with", "from", "your", "have", "been"):
+            if w not in seen and w not in stop:
                 seen.append(w)
-        return seen[:5]
+        return seen[:8]

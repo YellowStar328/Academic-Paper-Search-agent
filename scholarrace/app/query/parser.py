@@ -70,12 +70,13 @@ class QueryParser:
     def provider(self) -> LLMProvider:
         if self._provider is None:
             settings = get_settings()
-            if settings.is_test or not settings.strong_model_api_key:
+            if settings.is_test or not settings.qwen_api_key:
                 self._provider = MockLLMProvider(model_name="query_parser")
             else:
-                from app.agents.base import create_strong_judge_provider
+                # Use lightweight Qwen instead of STRONG for token efficiency
+                from app.agents.qwen import QwenAgent
 
-                self._provider = create_strong_judge_provider()
+                self._provider = QwenAgent().provider
         return self._provider
 
     async def parse(

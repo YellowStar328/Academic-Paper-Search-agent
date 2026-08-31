@@ -18,8 +18,9 @@ from app.agents.deepseek import DeepSeekAgent
 from app.agents.glm import GLMAgent
 from app.agents.qwen import QwenAgent
 from app.models.agent import AgentRun
-from app.models.candidate import CandidateQuery, JudgeResult
+from app.models.candidate import AgentReport, CandidateQuery, JudgeResult
 from app.models.query import SearchQuery
+from app.retrieval.base import SearchProvider
 
 logger = logging.getLogger(__name__)
 
@@ -292,3 +293,82 @@ class MultiAgentCoordinator:
                 )
             )
         return judged
+
+    # ------------------------------------------------------------------
+    # New: worker-style procurement (agents do their own search + judge)
+    # ------------------------------------------------------------------
+
+    def inject_providers(
+        self,
+        providers: list[SearchProvider],
+        max_per_source: int = 10,
+    ) -> None:
+        """Inject retrieval providers into every agent (worker mode).
+
+        Once injected, each agent can independently dispatch retrieval
+        and judge papers without going through the pipeline's unified
+        retrieval stage.
+        """
+        for agent in self.agents:
+            if hasattr(agent, "set_providers"):
+                agent.set_providers(providers, max_per_source)
+            else:
+                logger.warning(
+                    "Agent %s has no set_providers — worker mode disabled",
+                    agent.model_name,
+                )
+
+    async def dispatch_and_collect(
+        self,
+        query: SearchQuery,
+        candidates_per_agent: dict[str, list[CandidateQuery]],
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
+    ) -> list[AgentReport]:
+        """Dispatch each agent to do its own search + judge + report.
+
+        This is the core of the "power-delegation" flow:
+        - Each agent generates its own keywords (already done in stage 2)
+        - Each agent dispatches retrieval providers itself
+        - Each agent judges the abstracts it retrieved
+        - Each agent writes an AgentReport
+
+        The strong model then reviews all reports and makes the final call.
+
+        Args:
+            query: The structured user query.
+            candidates_per_agent: Map of model_name -> candidates from stage 2.
+            year_start: Optional year filter start.
+            year_end: Optional year filter end.
+
+        Returns:
+            List of AgentReport (one per agent).
+        """
+
+        async def _run_worker(agent) -> AgentReport:
+            """Run one agent's full procurement loop."""
+            cands = candidates_per_agent.get(agent.model_name, [])
+            try:
+                report = await agent.search_and_judge(
+                    query=query,
+                    candidates=cands,
+                    year_start=year_start,
+                    year_end=year_end,
+                )
+                return report
+            except Exception as e:
+                logger.exception(
+                    "Worker %s procurement failed: %s", agent.model_name, e
+                )
+                return AgentReport(
+                    agent_model=agent.model_name,
+                    search_queries=[c.query for c in cands],
+                    success=False,
+                    error=str(e),
+                )
+
+        reports = await asyncio.gather(
+            *[_run_worker(a) for a in self.agents],
+            return_exceptions=False,
+        )
+        return reports

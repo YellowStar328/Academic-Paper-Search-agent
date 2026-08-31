@@ -107,6 +107,37 @@ class FinalRanker:
         # If max similarity is high, redundancy is high (score low)
         return max(1.0 - max_sim, 0.0)
 
+    @staticmethod
+    def _relevance_tier(
+        relevance: float, emb_sim: Optional[float] = None
+    ) -> str:
+        """Classify relevance into qualitative tiers.
+
+        Tiers (configurable via Settings.relevance_thresholds):
+        - 'highly_relevant': directly addresses the query
+        - 'relevant': related but not central
+        - 'partially_relevant': tangential connection
+        - 'marginally_relevant': weak match
+        """
+        s = get_settings()
+        thresholds = getattr(s, "relevance_thresholds", None)
+        if thresholds is None:
+            thresholds = {
+                "highly_relevant": 0.65,
+                "relevant": 0.40,
+                "partially_relevant": 0.20,
+            }
+        eff = relevance
+        if relevance < (thresholds.get("partially_relevant", 0.20)) and emb_sim is not None:
+            eff = max(relevance, emb_sim)
+        if eff >= thresholds["highly_relevant"]:
+            return "highly_relevant"
+        if eff >= thresholds["relevant"]:
+            return "relevant"
+        if eff >= thresholds["partially_relevant"]:
+            return "partially_relevant"
+        return "marginally_relevant"
+
     def rank(
         self,
         papers: list[Paper],
@@ -187,6 +218,7 @@ class FinalRanker:
                     final_score=final,
                     embedding_similarity=emb_sim,
                     judge_reasoning=jr.reasoning if jr else "",
+                    relevance_tier=self._relevance_tier(relevance, emb_sim),
                 )
             )
 

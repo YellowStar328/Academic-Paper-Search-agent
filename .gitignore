@@ -219,3 +219,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# OS files
+.DS_Store
+
+# Benchmark run artifacts (regenerated per run, not source code)
+scholarrace/results/
+scholarrace/benchmark_test2.json
+
+# Temporary scripts
+commit_changes.sh

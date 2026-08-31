@@ -11,7 +11,7 @@ from typing import Optional
 from app.agents.base import BaseOpenAIProvider, LLMProvider, create_strong_judge_provider
 from app.agents.mock import MockLLMProvider
 from app.config import get_settings
-from app.models.candidate import CandidateQuery, JudgeResult, PaperJudgeResult
+from app.models.candidate import AgentPaperReport, AgentReport, CandidateQuery, JudgeResult, PaperJudgeResult
 from app.models.paper import Paper
 from app.models.query import SearchQuery
 
@@ -59,6 +59,45 @@ Paper abstract: {abstract}
 
 Evaluate this paper's relevance. Return JSON:
 {{"relevance_score": 0.0-1.0, "authority_score": 0.0-1.0, "reasoning": "...", "key_findings": [...]}}"""
+
+
+# ---------------------------------------------------------------------------
+# Strong-model review of agent procurement reports (worker mode)
+# ---------------------------------------------------------------------------
+
+REVIEW_REPORTS_SYSTEM_PROMPT = """You are the strong model coordinating three procurement agents (Qwen, DeepSeek, GLM).
+
+Each agent independently:
+1. Generated its own search keywords
+2. Dispatched retrieval providers (arXiv, Semantic Scholar, etc.)
+3. Judged each paper's abstract for relevance
+
+Now you receive each agent's report. Your job is to make the FINAL decision:
+
+For each paper mentioned across all reports, give a final score (0.0-1.0) based on:
+- The agents' assessments (weighted, not just averaged)
+- Cross-agent agreement (papers found + judged relevant by multiple agents get a boost)
+- Your own authority assessment (venue, citations, authors)
+
+You MUST return JSON with a "final_papers" array. Each entry:
+{
+  "paper_id": "string",
+  "final_relevance_score": 0.0-1.0,
+  "final_authority_score": 0.0-1.0,
+  "final_reasoning": "one sentence",
+  "endorsed_by": ["qwen", "deepseek", "glm"]  // which agents endorsed this paper
+}
+
+Only include papers with final_relevance_score >= 0.5. Sort by final_relevance_score descending.
+"""
+
+REVIEW_REPORTS_TEMPLATE = """Original query: {query}
+
+Below are procurement reports from {n} agents.
+
+{reports_json}
+
+Review these reports and make your FINAL selection. Return JSON with a "final_papers" array (sorted by final_relevance_score descending, only score >= 0.5)."""
 
 
 class StrongJudge:
@@ -147,6 +186,124 @@ class StrongJudge:
         results.sort(key=lambda r: r.score, reverse=True)
 
         return results[:top_k]
+
+    async def review_agent_reports(
+        self,
+        query: SearchQuery,
+        reports: list[AgentReport],
+    ) -> list[tuple[Paper, float, str, list[str]]]:
+        """Strong model reviews all agent procurement reports and makes final call.
+
+        Args:
+            query: The structured user query.
+            reports: AgentReport list from Qwen/DeepSeek/GLM.
+
+        Returns:
+            List of (paper, final_score, reasoning, endorsed_by) for
+            papers with final_score >= 0.5, sorted descending.
+        """
+        import json as _json
+
+        # Build a compact representation of all reports for the strong model.
+        reports_payload = []
+        paper_index: dict[str, Paper] = {}
+
+        for rep in reports:
+            entry = {
+                "agent": rep.agent_model,
+                "search_queries": rep.search_queries,
+                "rationale": rep.rationale,
+                "papers": [],
+            }
+            for pr in rep.paper_reports:
+                pid = pr.paper.identity_key() or pr.paper.title.lower()
+                paper_index[pid] = pr.paper
+                entry["papers"].append(
+                    {
+                        "paper_id": pid,
+                        "title": pr.paper.title,
+                        "abstract": (pr.paper.abstract[:300] if pr.paper.abstract else "N/A"),
+                        "agent_relevance_score": pr.agent_relevance_score,
+                        "agent_reasoning": pr.agent_reasoning,
+                        "agent_key_findings": pr.agent_key_findings,
+                        "source": pr.paper.source,
+                        "year": pr.paper.year,
+                        "venue": pr.paper.venue,
+                        "citation_count": pr.paper.citation_count,
+                    }
+                )
+            reports_payload.append(entry)
+
+        prompt = REVIEW_REPORTS_TEMPLATE.format(
+            query=query.semantic_core or query.original_query,
+            n=len(reports),
+            reports_json=_json.dumps(reports_payload, ensure_ascii=False, indent=2),
+        )
+
+        response = await self.provider.generate(
+            prompt=prompt,
+            temperature=0.2,
+            system_prompt=REVIEW_REPORTS_SYSTEM_PROMPT,
+            response_schema={"type": "json_object"},
+        )
+        self.last_token_usage += response.token_usage
+
+        if not response.success:
+            # Fallback: weighted average of agent scores
+            return self._fallback_review(reports, paper_index)
+
+        try:
+            data = _json.loads(response.content)
+            final_papers = data.get("final_papers", [])
+            results: list[tuple[Paper, float, str, list[str]]] = []
+            for fp in final_papers:
+                pid = fp.get("paper_id", "")
+                paper = paper_index.get(pid)
+                if paper is None:
+                    continue
+                score = float(fp.get("final_relevance_score", 0.0))
+                if score < 0.5:
+                    continue
+                reasoning = fp.get("final_reasoning", "")
+                endorsed = fp.get("endorsed_by", [])
+                results.append((paper, score, reasoning, endorsed))
+
+            results.sort(key=lambda x: x[1], reverse=True)
+            return results
+        except (_json.JSONDecodeError, ValueError, TypeError):
+            return self._fallback_review(reports, paper_index)
+
+    @staticmethod
+    def _fallback_review(
+        reports: list[AgentReport],
+        paper_index: dict[str, Paper],
+    ) -> list[tuple[Paper, float, str, list[str]]]:
+        """Fallback: weighted average of agent scores when LLM parsing fails."""
+        # Collect scores per paper
+        paper_scores: dict[str, list[float]] = {}
+        paper_endorsed: dict[str, list[str]] = {}
+        for rep in reports:
+            for pr in rep.paper_reports:
+                pid = pr.paper.identity_key() or pr.paper.title.lower()
+                paper_scores.setdefault(pid, []).append(pr.agent_relevance_score)
+                paper_endorsed.setdefault(pid, []).append(rep.agent_model)
+
+        results = []
+        for pid, scores in paper_scores.items():
+            paper = paper_index.get(pid)
+            if paper is None:
+                continue
+            avg = sum(scores) / len(scores)
+            # Boost for cross-agent agreement
+            boost = 0.05 * (len(scores) - 1)
+            final_score = min(1.0, avg + boost)
+            if final_score < 0.5:
+                continue
+            endorsed = paper_endorsed.get(pid, [])
+            results.append((paper, final_score, "fallback weighted avg", endorsed))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
 
 
 class PaperJudge:

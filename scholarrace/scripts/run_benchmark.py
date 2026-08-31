@@ -153,12 +153,14 @@ def load_pasa_dataset(skip_download: bool = False) -> list[dict]:
 
     Supports loading from any local jsonl file in the benchmark data dir
     that matches the PaSa format ({"question": ..., "answer_arxiv_id": [...]}).
-    Search order: dev.jsonl, pasa_real_scholar_query_test.jsonl, then download.
+    Search order: pasa_real_scholar_query_test.jsonl, dev.jsonl, then download.
     """
-    # Prefer locally available datasets — check dev.jsonl first (user benchmark)
+    # Prefer the real scholar query test set (50 queries) over the dev
+    # split (1000 synthetic queries) — the real set is what the user
+    # benchmarked against and matches the PaSa paper's RealScholarQuery.
     candidates = [
-        DATA_DIR / "dev.jsonl",
         DATA_DIR / "pasa_real_scholar_query_test.jsonl",
+        DATA_DIR / "dev.jsonl",
     ]
     dest = next((p for p in candidates if p.exists()), None)
     if dest is None:
@@ -262,6 +264,7 @@ def _load_asta_via_datasets(dest: Path) -> Path:
 def build_real_pipeline(
     year_start: Optional[int] = None,
     year_end: Optional[int] = None,
+    worker_mode: bool = False,
 ) -> SearchPipeline:
     """Build a SearchPipeline that uses REAL LLM + retrieval providers.
 
@@ -325,6 +328,7 @@ def build_real_pipeline(
         settings=settings,
         year_start=year_start,
         year_end=year_end,
+        worker_mode=worker_mode,
     )
 
 
@@ -573,6 +577,8 @@ def main() -> None:
     ap.add_argument("--concurrency", type=int, default=1)
     ap.add_argument("--skip-download", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--worker-mode", action="store_true",
+                    help="Enable worker mode: agents do their own search+judge, strong model reviews")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
 
@@ -586,8 +592,9 @@ def main() -> None:
 
     pipeline = None
     if not args.dry_run:
-        logger.info("Building real pipeline (APP_ENV=%s)...", os.environ.get("APP_ENV", "development"))
-        pipeline = build_real_pipeline()
+        logger.info("Building real pipeline (APP_ENV=%s, worker_mode=%s)...",
+                    os.environ.get("APP_ENV", "development"), args.worker_mode)
+        pipeline = build_real_pipeline(worker_mode=args.worker_mode)
     else:
         logger.warning("DRY RUN — pipeline will not execute; no metrics produced")
 
@@ -596,6 +603,7 @@ def main() -> None:
         "top_k": args.top_k,
         "concurrency": args.concurrency,
         "dry_run": args.dry_run,
+        "worker_mode": args.worker_mode,
         "benchmarks": {},
     }
 

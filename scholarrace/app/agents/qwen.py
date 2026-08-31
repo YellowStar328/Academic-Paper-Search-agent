@@ -7,6 +7,7 @@ from typing import Optional
 
 from app.agents.base import BaseOpenAIProvider, LLMProvider, LLMResponse, create_qwen_provider
 from app.agents.mock import MockLLMProvider
+from app.agents.worker import SearchWorker
 from app.config import get_settings
 from app.models.query import SearchQuery
 from app.models.candidate import CandidateQuery
@@ -27,13 +28,16 @@ Domain: {domain}
 Generate search queries focusing on method names and terminology."""
 
 
-class QwenAgent:
+class QwenAgent(SearchWorker):
     """Query generation agent using Qwen model, focused on method names."""
 
     def __init__(self, provider: Optional[LLMProvider] = None):
         self._provider = provider
         self.model_name = "qwen"
         self.last_token_usage: int = 0
+        # SearchWorker defaults
+        self._providers = []
+        self._max_per_source = 10
 
     @property
     def provider(self) -> LLMProvider:

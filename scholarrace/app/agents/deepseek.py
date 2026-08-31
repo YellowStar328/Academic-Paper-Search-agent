@@ -7,6 +7,7 @@ from typing import Optional
 
 from app.agents.base import BaseOpenAIProvider, LLMProvider, create_deepseek_provider
 from app.agents.mock import MockLLMProvider
+from app.agents.worker import SearchWorker
 from app.config import get_settings
 from app.models.query import SearchQuery
 from app.models.candidate import CandidateQuery
@@ -27,13 +28,15 @@ Domain: {domain}
 Generate search queries focusing on problem restatement and research routes."""
 
 
-class DeepSeekAgent:
+class DeepSeekAgent(SearchWorker):
     """Query generation agent using DeepSeek model, focused on problem restatement."""
 
     def __init__(self, provider: Optional[LLMProvider] = None):
         self._provider = provider
         self.model_name = "deepseek"
         self.last_token_usage: int = 0
+        self._providers = []
+        self._max_per_source = 10
 
     @property
     def provider(self) -> LLMProvider:

@@ -220,6 +220,64 @@ class ResearchGraphBuilder:
 
         return clusters
 
+    async def label_clusters_with_llm(
+        self,
+        clusters: list[GraphCluster],
+        papers: list[Paper],
+    ) -> None:
+        """Generate semantic topic labels for clusters via LLM.
+
+        Replaces the centroid-title heuristic with an LLM-generated
+        concise topic label.  Falls back to centroid title on failure.
+        Should be called after ``build()`` from an async context.
+        """
+        settings = get_settings()
+        if settings.is_test or not settings.qwen_api_key:
+            return
+
+        try:
+            from app.agents.qwen import QwenAgent
+
+            provider = QwenAgent().provider
+        except Exception as e:
+            logger.warning(f"Cluster LLM labeling skipped: {e}")
+            return
+
+        paper_map = {p.paper_id: p for p in papers}
+
+        for cluster in clusters:
+            member_papers = [
+                paper_map[pid]
+                for pid in cluster.paper_ids
+                if pid in paper_map
+            ]
+            if not member_papers:
+                continue
+
+            titles_str = "\n".join(
+                f"- {p.title}" for p in member_papers[:10]
+            )
+            prompt = (
+                f"You are a research taxonomy expert.\n"
+                f"Below are {len(member_papers)} paper titles from a cluster:\n"
+                f"{titles_str}\n\n"
+                f"Generate a concise topic label (3-8 words) that captures "
+                f"the common theme. Respond with ONLY the label, no explanation."
+            )
+
+            try:
+                resp = await provider.generate(
+                    prompt=prompt,
+                    system_prompt="You are a research taxonomy expert.",
+                    temperature=0.2,
+                )
+                label = resp.content.strip().strip('"').strip("'")
+                if label and len(label) <= 80:
+                    cluster.label = label
+            except Exception as e:
+                logger.debug(f"Cluster {cluster.cluster_id} label failed: {e}")
+                continue
+
     def _kmeans(self, vecs: np.ndarray, k: int, max_iter: int = 20) -> list[int]:
         """Simple k-means clustering.
 
